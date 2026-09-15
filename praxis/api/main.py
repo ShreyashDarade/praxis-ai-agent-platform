@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Awaitable, Callable
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from praxis.config import Settings
 from praxis.core.interfaces import HealthStatus
@@ -32,12 +33,19 @@ register_health_check(_database_check)
 
 
 @app.get("/health")
-async def health() -> dict:
-    results = [await check() for check in HEALTH_CHECKS]
+async def health() -> JSONResponse:
+    results = []
+    for check in HEALTH_CHECKS:
+        try:
+            results.append(await check())
+        except Exception as exc:  # noqa: BLE001 - one bad check must not take down /health
+            results.append(HealthStatus(name=check.__name__, healthy=False, detail=str(exc)))
+
     overall = all(r.healthy for r in results)
-    return {
+    body = {
         "healthy": overall,
         "components": [
             {"name": r.name, "healthy": r.healthy, "detail": r.detail} for r in results
         ],
     }
+    return JSONResponse(content=body, status_code=200 if overall else 503)
