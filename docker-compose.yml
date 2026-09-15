@@ -5,6 +5,7 @@ services:
       POSTGRES_USER: praxis
       POSTGRES_PASSWORD: praxis
       POSTGRES_DB: praxis
+    restart: unless-stopped
     ports:
       - "5433:5432"
     volumes:
