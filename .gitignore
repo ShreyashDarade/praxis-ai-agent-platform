@@ -1,0 +1,26 @@
+# Worktrees (subagent-driven-development, using-git-worktrees)
+.worktrees/
+worktrees/
+
+# SDD scratch workspace (ledgers, briefs, review packages)
+.superpowers/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Env / secrets
+.env
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
