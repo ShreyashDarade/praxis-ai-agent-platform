@@ -11,6 +11,7 @@ from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 
 from praxis.config import Settings
+from praxis.connectors.bootstrap import build_registry
 from praxis.memory.db import PostgresStore
 
 app = typer.Typer(help="Praxis operator CLI")
@@ -58,12 +59,26 @@ async def _check_database(settings: Settings) -> str:
     return "database reachable"
 
 
-# Later phases append to this list (connector registration, sandbox
-# verification, prompt seeding) rather than editing init() itself - OCP.
+async def _register_connectors(settings: Settings) -> str:
+    # Register example connectors from spec §16 if their config is
+    # present; skipped, not failed, for any left unconfigured (spec §19
+    # step 4) - an empty registry is a valid, expected state, not an
+    # init failure.
+    registry = build_registry(settings)
+    connectors = registry.all()
+    if not connectors:
+        return "0 connectors registered (none configured)"
+    names = ", ".join(connector.name for connector in connectors)
+    return f"{len(connectors)} connector(s) registered: {names}"
+
+
+# Later phases append to this list (sandbox verification, prompt
+# seeding) rather than editing init() itself - OCP.
 INIT_STEPS: list[InitStep] = [
     InitStep("validate config", _validate_config),
     InitStep("apply schema", _apply_schema),
     InitStep("check database", _check_database),
+    InitStep("register connectors", _register_connectors),
 ]
 
 
