@@ -36,6 +36,17 @@ dependencies = [
     "langchain-text-splitters>=1.1,<2.0",
     "pillow>=12.3,<13.0",
     "openpyxl>=3.1,<4.0",
+    # Phase 4 (LLM Catalogue, Prompt Manager, Memory completion,
+    # Document Enrichment; spec §7, §9). Pinned to the version actually
+    # resolved and verified in this venv, not a bare unbounded ">=" -
+    # same discipline as the Phase 3 pins above. `anthropic` 1.x is a
+    # new major line (the SDK's own httpx2-based transport) - capped
+    # below 2.0 until a deliberate migration.
+    "anthropic>=1.6,<2.0",
+    # Jinja2 was already present transitively (via spacy/torch) but is
+    # now a direct dependency of PromptManager - declared explicitly at
+    # the version already installed and verified working.
+    "jinja2>=3.1.6,<4.0",
 ]
 
 # Windows-only caveat, discovered and fixed while verifying this exact

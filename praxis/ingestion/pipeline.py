@@ -1,9 +1,13 @@
 # praxis/ingestion/pipeline.py
-"""Ingestion & RAG orchestration (spec §5): upload -> parse -> chunk -> embed -> index -> retrieve.
+"""Ingestion & RAG orchestration (spec §5): upload -> parse -> chunk -> enrich -> embed -> index -> retrieve.
 
-Step 4 (Enrich) is deliberately skipped per this phase's scope - it
-needs the LLM Catalogue (Phase 4) and no LLM-calling code belongs in
-this phase.
+Step 4 (Enrich) now runs between parse and chunk, per the spec's
+lifecycle ordering, via an optional `DocumentEnrichment` (Phase 4's LLM
+Catalogue + Prompt Manager). It is genuinely optional: `enrichment`
+defaults to `None`, so every existing caller that doesn't pass one gets
+byte-for-byte the same behavior as before this phase - enrichment is
+additive, not mandatory on every ingest (mirrors spec §5 step 4's
+"only when relations are meaningful"/explicitly requested framing).
 
 Chunker selection by mime type is business logic that lives here, not
 behind an extension-point registry like `ParserRegistry` - adding a new
@@ -20,10 +24,36 @@ from typing import Any, Protocol
 from praxis.core.interfaces import BlobStore, Chunker, Embedder, Parser, VectorStore
 from praxis.ingestion.chunkers.recursive_chunker import RecursiveChunker
 from praxis.ingestion.chunkers.table_aware_chunker import TableAwareChunker
+from praxis.ingestion.enrichment.document_enrichment import DocumentEnrichment, EnrichmentResult
 from praxis.memory.db import PostgresStore
 from praxis.memory.models import Attachment
 
 logger = logging.getLogger(__name__)
+
+
+class IngestResult(str):
+    """`ingest()`'s return value.
+
+    Subclasses `str` rather than being a plain dataclass so this stays
+    fully backward compatible: every existing/pre-existing caller that
+    treats `ingest()`'s return value as a bare `attachment_id` string
+    (equality checks, use as a `session.get()` primary key, dict keys,
+    string formatting, ...) keeps working completely unchanged. The
+    `summary`/`topics` attributes are purely additive, populated only
+    when an `enrichment` was passed in and actually ran.
+    """
+
+    summary: str | None
+    topics: list[str] | None
+
+    def __new__(
+        cls, attachment_id: str, summary: str | None = None, topics: list[str] | None = None
+    ) -> "IngestResult":
+        obj = super().__new__(cls, attachment_id)
+        obj.summary = summary
+        obj.topics = topics
+        return obj
+
 
 # The two tabular mime types TabularParser handles (spec §5 step 2) get
 # the row/section-aware chunker; everything else gets the prose one.
@@ -75,13 +105,22 @@ async def ingest(
     vector_store: VectorStore,
     db: PostgresStore,
     chunker: Chunker | None = None,
-) -> str:
-    """Runs one attachment through the full ingestion pipeline; returns its `Attachment.id`.
+    enrichment: DocumentEnrichment | None = None,
+) -> IngestResult:
+    """Runs one attachment through the full ingestion pipeline; returns an
+    `IngestResult` (an `Attachment.id` string, usable exactly as one).
 
     `chunker` is normally left unset - the right strategy (`TableAwareChunker`
     vs `RecursiveChunker`) is picked from `mime_type` internally. It's
     still accepted as an explicit override for callers/tests that need
     to force a specific chunker.
+
+    `enrichment` is optional and defaults to `None` (no enrichment,
+    identical to this pipeline's pre-Phase-4 behavior). When provided,
+    `enrichment.enrich(text)` runs after parsing and before chunking
+    (spec §5's parse -> chunk -> enrich -> embed ordering), and the
+    resulting summary/topics are carried back on the returned
+    `IngestResult` rather than dropped.
     """
     async with db.session() as session:
         attachment = Attachment(mime_type=mime_type, source=source, size_bytes=len(data), status="uploaded")
@@ -99,6 +138,10 @@ async def ingest(
 
         parser = parser_registry.get_parser_for(mime_type)
         text = await parser.parse(data, mime_type)
+
+        enrichment_result: EnrichmentResult | None = None
+        if enrichment is not None:
+            enrichment_result = await enrichment.enrich(text)
 
         chosen_chunker = chunker if chunker is not None else _chunker_for(mime_type)
         chunks = chosen_chunker.chunk(text)
@@ -121,7 +164,9 @@ async def ingest(
         await _set_status(db, attachment_id, "failed")
         raise
 
-    return attachment_id
+    if enrichment_result is not None:
+        return IngestResult(attachment_id, summary=enrichment_result.summary, topics=enrichment_result.topics)
+    return IngestResult(attachment_id)
 
 
 async def retrieve(

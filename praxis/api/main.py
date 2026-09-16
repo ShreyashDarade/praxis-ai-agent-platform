@@ -1,7 +1,7 @@
 """FastAPI application entrypoint (spec §14)."""
 from __future__ import annotations
 
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
@@ -95,7 +95,7 @@ async def health() -> JSONResponse:
 
 
 @app.post("/attachments", status_code=201)
-async def upload_attachment(file: UploadFile = File(...)) -> dict[str, str]:
+async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
     """File upload -> Ingestion pipeline (spec §5, §14).
 
     Settings/PostgresStore are constructed fresh per request rather than
@@ -104,6 +104,14 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, str]:
     different database per test (or per deployment reload) without
     re-importing this module. The embedder and parser registry, in
     contrast, don't depend on Settings and are built once above.
+
+    No `DocumentEnrichment` is constructed/passed here by default - it
+    would put a real LLM call on the hot path of every upload (cost and
+    latency neither the spec nor this endpoint's existing contract
+    calls for). `ingest()`'s `enrichment` parameter stays available for
+    a future deployment-level toggle; this handler already surfaces a
+    `summary`/`topics` field on the response whenever `ingest()` did
+    return one, so wiring enrichment in later needs no change here.
     """
     data = await file.read()
     mime_type = file.content_type or "application/octet-stream"
@@ -138,4 +146,12 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, str]:
     finally:
         await db.dispose()
 
-    return {"attachment_id": attachment_id, "status": "indexed"}
+    response: dict[str, Any] = {"attachment_id": attachment_id, "status": "indexed"}
+    # `attachment_id` is an `IngestResult` (a `str` subclass) - `summary`
+    # is only non-None when an `enrichment` was passed to `ingest()` and
+    # actually ran; never drop it on the floor when it did (spec §5
+    # step 4, this endpoint's docstring above).
+    if attachment_id.summary is not None:
+        response["summary"] = attachment_id.summary
+        response["topics"] = attachment_id.topics or []
+    return response
