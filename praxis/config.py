@@ -37,6 +37,23 @@ class Settings(BaseSettings):
     )
     sandbox_timeout_seconds: int = Field(default=30, ge=1, le=300)
 
+    # Phase 7 (Observability, spec §18): "Scheduled health scan
+    # (APScheduler, e.g. every 5 min) writes health history to Postgres."
+    # Wired into `praxis.agents.scheduler.Scheduler` by
+    # `praxis.api.main`'s module-level setup.
+    health_scan_interval_seconds: int = Field(default=300, ge=1)
+
+    # Phase 7 (Exception handling, spec §12): how long a task may sit
+    # `awaiting_approval`/`awaiting_clarification` before
+    # `praxis.api.main.sweep_stale_approvals` marks it `failed` with an
+    # `ApprovalTimeoutError` detail. Doubles as that sweep job's own
+    # scheduling interval (spec's own suggested default, "e.g. 3600") -
+    # a dedicated, separate sweep-interval setting would let the sweep
+    # run far more often than the timeout it's checking for, which buys
+    # nothing; running it once per timeout window is exactly often
+    # enough to catch every task the moment it crosses that threshold.
+    approval_timeout_seconds: int = Field(default=3600, ge=1)
+
     # Local-filesystem `BlobStore` root (spec §2: "Local filesystem
     # (scratch dir)" is the MVP-deployed backend). Has a default so its
     # absence never blocks Settings() construction the way a missing

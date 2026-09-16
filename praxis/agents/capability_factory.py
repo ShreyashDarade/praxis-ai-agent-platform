@@ -58,16 +58,23 @@ import re
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from praxis.agents import skill as skill_module
 from praxis.agents import skill_registry
 from praxis.agents.skill import Skill
+from praxis.cache.memory_cache import InMemoryCache
+from praxis.connectors.retry import call_with_retry
 from praxis.core.exceptions import SynthesisValidationError
-from praxis.core.interfaces import Connector, SandboxExecutor
+from praxis.core.interfaces import Cache, Connector, SandboxExecutor
 from praxis.llm.catalogue import LLMCatalogue
 from praxis.llm.prompt_manager import PromptManager
 from praxis.memory.db import PostgresStore
 from praxis.memory.graph_store import PgGraphStore
 from praxis.memory.models import SkillRecord
+from praxis.observability.tracing import start_span
+
+_logger = structlog.get_logger(__name__)
 
 _PROMPT_NAME = "synthesize_skill"
 _PROMPT_VERSION = "v1"
@@ -77,6 +84,14 @@ _LLM_PURPOSE = "code_synthesis"
 # bounded retry (2 attempts)" per spec §12.
 _MAX_ATTEMPTS = 3
 _DEFAULT_SANDBOX_TIMEOUT_SECONDS = 30
+
+# Short TTL (spec §11: "Connector/schema-introspection cache ... fronts
+# the GraphStore schema records in §9, short TTL") - long enough to
+# skip re-introspection across the several syntheses one task typically
+# triggers back-to-back, short enough that a connector's schema
+# actually changing is noticed again well within a deployment's
+# lifetime, unlike the GraphStore record itself (durable, unbounded).
+_SCHEMA_CACHE_TTL_SECONDS = 300
 
 # A full skill module + a self-test with several real assertions
 # routinely runs to 100+ lines combined; on a retry, the prompt also
@@ -217,6 +232,8 @@ class CapabilityFactory:
         skills_dir: Path | str,
         *,
         sandbox_timeout_seconds: int = _DEFAULT_SANDBOX_TIMEOUT_SECONDS,
+        schema_cache: Cache | None = None,
+        schema_cache_ttl_seconds: int = _SCHEMA_CACHE_TTL_SECONDS,
     ) -> None:
         self._catalogue = catalogue
         self._prompt_manager = prompt_manager
@@ -225,6 +242,8 @@ class CapabilityFactory:
         self._store = store
         self._skills_dir = Path(skills_dir)
         self._sandbox_timeout_seconds = sandbox_timeout_seconds
+        self._schema_cache: Cache = schema_cache if schema_cache is not None else InMemoryCache()
+        self._schema_cache_ttl_seconds = schema_cache_ttl_seconds
 
     async def synthesize(
         self,
@@ -233,72 +252,113 @@ class CapabilityFactory:
         connector: Connector | None = None,
         task_id: str | None = None,
     ) -> Skill:
-        connector_schema: dict[str, Any] | None = None
-        if connector is not None:
-            connector_schema = await self._connector_schema(connector)
-        connector_schema_text = (
-            json.dumps(connector_schema, indent=2, default=str) if connector_schema is not None else None
-        )
-
-        previous_code: str | None = None
-        previous_self_test: str | None = None
-        error_detail: str | None = None
-        last_code = ""
-        last_detail = ""
-
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            prompt = self._prompt_manager.render(
-                _PROMPT_NAME,
-                _PROMPT_VERSION,
-                need_description=need_description,
-                connector_schema=connector_schema_text,
-                previous_code=previous_code,
-                previous_self_test=previous_self_test,
-                error_detail=error_detail,
+        with start_span("capability_factory.synthesize", task_id=task_id or "", connector=connector.name if connector else ""):
+            _logger.info(
+                "synthesis_started", need_description=need_description, task_id=task_id,
+                connector=connector.name if connector else None,
             )
-            response = await self._catalogue.complete(
-                _LLM_PURPOSE, prompt, max_tokens=_MAX_RESPONSE_TOKENS
+            connector_schema: dict[str, Any] | None = None
+            if connector is not None:
+                connector_schema = await self._connector_schema(connector)
+            connector_schema_text = (
+                json.dumps(connector_schema, indent=2, default=str) if connector_schema is not None else None
             )
 
-            try:
-                module_code, self_test_code = _parse_response(response)
-            except ValueError as exc:
-                last_code = response
-                last_detail = f"attempt {attempt}/{_MAX_ATTEMPTS}: {exc}"
-                previous_code, previous_self_test, error_detail = response, "", last_detail
-                continue
+            previous_code: str | None = None
+            previous_self_test: str | None = None
+            error_detail: str | None = None
+            last_code = ""
+            last_detail = ""
 
-            script = _build_sandbox_script(module_code, self_test_code)
-            result = await self._sandbox.run(script, timeout_seconds=self._sandbox_timeout_seconds)
+            for attempt in range(1, _MAX_ATTEMPTS + 1):
+                _logger.info(
+                    "synthesis_attempt_started", attempt=attempt, max_attempts=_MAX_ATTEMPTS,
+                    task_id=task_id,
+                )
+                prompt = self._prompt_manager.render(
+                    _PROMPT_NAME,
+                    _PROMPT_VERSION,
+                    need_description=need_description,
+                    connector_schema=connector_schema_text,
+                    previous_code=previous_code,
+                    previous_self_test=previous_self_test,
+                    error_detail=error_detail,
+                )
+                response = await self._catalogue.complete(
+                    _LLM_PURPOSE, prompt, max_tokens=_MAX_RESPONSE_TOKENS
+                )
 
-            if result.exit_code == 0 and _SUCCESS_MARKER in result.stdout:
-                return await self._register(module_code, connector=connector, task_id=task_id)
+                try:
+                    module_code, self_test_code = _parse_response(response)
+                except ValueError as exc:
+                    last_code = response
+                    last_detail = f"attempt {attempt}/{_MAX_ATTEMPTS}: {exc}"
+                    previous_code, previous_self_test, error_detail = response, "", last_detail
+                    _logger.warning(
+                        "synthesis_attempt_failed", attempt=attempt, max_attempts=_MAX_ATTEMPTS,
+                        reason="response_did_not_parse", detail=last_detail,
+                    )
+                    continue
 
-            last_code = module_code
-            last_detail = (
-                f"attempt {attempt}/{_MAX_ATTEMPTS}: sandbox exit_code={result.exit_code}\n"
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+                script = _build_sandbox_script(module_code, self_test_code)
+                result = await self._sandbox.run(script, timeout_seconds=self._sandbox_timeout_seconds)
+
+                if result.exit_code == 0 and _SUCCESS_MARKER in result.stdout:
+                    _logger.info(
+                        "synthesis_attempt_succeeded", attempt=attempt, max_attempts=_MAX_ATTEMPTS,
+                        task_id=task_id,
+                    )
+                    return await self._register(module_code, connector=connector, task_id=task_id)
+
+                last_code = module_code
+                last_detail = (
+                    f"attempt {attempt}/{_MAX_ATTEMPTS}: sandbox exit_code={result.exit_code}\n"
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+                )
+                previous_code, previous_self_test, error_detail = module_code, self_test_code, last_detail
+                _logger.warning(
+                    "synthesis_attempt_failed", attempt=attempt, max_attempts=_MAX_ATTEMPTS,
+                    reason="sandbox_validation_failed", exit_code=result.exit_code,
+                )
+
+            _logger.error(
+                "synthesis_exhausted", need_description=need_description, task_id=task_id,
+                max_attempts=_MAX_ATTEMPTS,
             )
-            previous_code, previous_self_test, error_detail = module_code, self_test_code, last_detail
-
-        raise SynthesisValidationError(
-            f"synthesis of capability '{need_description}' failed sandbox validation after "
-            f"{_MAX_ATTEMPTS} attempts",
-            code=last_code,
-            detail=last_detail,
-        )
+            raise SynthesisValidationError(
+                f"synthesis of capability '{need_description}' failed sandbox validation after "
+                f"{_MAX_ATTEMPTS} attempts",
+                code=last_code,
+                detail=last_detail,
+            )
 
     # ------------------------------------------------------------------ #
-    # Connector schema caching (spec §9: "GraphStore - connector schemas
-    # already introspected, avoids re-introspecting the same DB every ask")
+    # Connector schema caching (spec §9/§11): a short-TTL InMemoryCache
+    # fronts the GraphStore lookup - on a cache hit, neither the
+    # GraphStore nor connector.describe() is ever touched; on a cache
+    # miss, falls through to Phase 6's existing GraphStore check, then
+    # connector.describe() (bounded-retried, spec §12) if that also
+    # misses, populating BOTH the GraphStore edge and this cache before
+    # returning.
     # ------------------------------------------------------------------ #
 
     async def _connector_schema(self, connector: Connector) -> dict[str, Any]:
-        cached = await self._graph_store.neighbors(connector.name, relation=_DESCRIBES_RELATION)
-        if cached:
-            return cached[0]["metadata"]["schema"]
+        cache_key = f"connector_schema:{connector.name}"
 
-        description = await connector.describe()
+        cached = await self._schema_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        graph_hit = await self._graph_store.neighbors(connector.name, relation=_DESCRIBES_RELATION)
+        if graph_hit:
+            schema = graph_hit[0]["metadata"]["schema"]
+            await self._schema_cache.set(cache_key, schema, ttl_seconds=self._schema_cache_ttl_seconds)
+            return schema
+
+        with start_span("connector.call", connector=connector.name, operation="describe"):
+            description = await call_with_retry(
+                connector.describe, connector_name=connector.name, operation="describe"
+            )
         digest = hashlib.sha256(
             json.dumps(description.schema, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:16]
@@ -307,6 +367,9 @@ class CapabilityFactory:
             relation=_DESCRIBES_RELATION,
             target=f"schema:{digest}",
             metadata={"kind": description.kind, "schema": description.schema},
+        )
+        await self._schema_cache.set(
+            cache_key, description.schema, ttl_seconds=self._schema_cache_ttl_seconds
         )
         return description.schema
 

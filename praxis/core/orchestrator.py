@@ -54,18 +54,26 @@ exactly per spec §8.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from praxis.agents.planner import Planner
 from praxis.agents.skill import Skill
+from praxis.cache.memory_cache import InMemoryCache
 from praxis.core.execution_graph import PlanStep, compute_levels, resolve_args
-from praxis.core.exceptions import SynthesisValidationError
+from praxis.core.exceptions import SandboxViolationError, SynthesisValidationError
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
 from praxis.memory.db import PostgresStore
 from praxis.memory.models import Task
+from praxis.observability.logging import bind_correlation_id
+from praxis.observability.tracing import start_span
+
+_logger = structlog.get_logger(__name__)
 
 
 class SkillRegistryLike(Protocol):
@@ -92,7 +100,17 @@ class CapabilityFactoryLike(Protocol):
 
 @dataclass
 class _TaskState:
-    """In-memory execution-graph state for one in-flight task (see module docstring)."""
+    """In-memory execution-graph state for one in-flight task (see module docstring).
+
+    `tool_cache` (spec §11's tool-result cache scope, "idempotent
+    read-only calls within a single task") is a fresh `InMemoryCache`
+    per task - this state object's own lifetime already IS one task's
+    execution (created in `start_task`, dropped in `_advance`/
+    `resume_after_approval` on a terminal outcome per the module
+    docstring's "short-term vs. long-term state" note), so a fresh
+    instance here naturally means the cache never outlives, or leaks
+    across, one task run.
+    """
 
     steps: list[PlanStep]
     levels: list[list[int]]
@@ -100,10 +118,19 @@ class _TaskState:
     next_level: int = 0
     paused_index: int | None = None
     pending_args: dict[int, dict[str, Any]] = field(default_factory=dict)
+    tool_cache: InMemoryCache = field(default_factory=InMemoryCache)
 
 
 def _describe_step(step: PlanStep) -> str:
     return f"{step.skill_name}({step.args})"
+
+
+def _tool_result_cache_key(skill_name: str, args: dict[str, Any]) -> str:
+    """Cache key for the tool-result scope: identical `skill_name` +
+    `args` (a read-only skill call is idempotent per spec §11) hash to
+    the same key, regardless of the args dict's key insertion order."""
+    payload = json.dumps({"skill": skill_name, "args": args}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class Orchestrator:
@@ -163,10 +190,16 @@ class Orchestrator:
             session.add(task)
             await session.commit()
             task_id = task.id
+            correlation_id = task.correlation_id
+
+        with bind_correlation_id(correlation_id):
+            _logger.info("task_started", task_id=task_id, intent_text=intent_text)
 
         try:
             steps = await self._planner.plan(intent_text, self._skills.all_skills())
         except Exception as exc:  # noqa: BLE001 - a planning failure must fail the task, not crash the caller
+            with bind_correlation_id(correlation_id):
+                _logger.error("task_planning_failed", task_id=task_id, error=str(exc))
             await self._fail_task(task_id, f"planning failed: {exc}", checklist=[])
             return task_id
 
@@ -216,44 +249,55 @@ class Orchestrator:
                     "it cannot be resumed here"
                 )
 
-            paused_index = state.paused_index
-            step = state.steps[paused_index]
+            with bind_correlation_id(task.correlation_id):
+                _logger.info("resume_after_approval_requested", task_id=task_id, approved=approved)
 
-            if not approved:
-                self._mark_item(task, paused_index, status="skipped", reason="rejected by operator")
-                task.status = "failed"
+                paused_index = state.paused_index
+                step = state.steps[paused_index]
+
+                if not approved:
+                    self._mark_item(task, paused_index, status="skipped", reason="rejected by operator")
+                    task.status = "failed"
+                    task.pending_input = None
+                    task.result = {
+                        "error": (
+                            f"step {paused_index} ('{step.skill_name}') was rejected by the "
+                            "operator; task aborted"
+                        )
+                    }
+                    _logger.info("task_rejected_by_operator", task_id=task_id, step=paused_index)
+                    await session.commit()
+                    del self._active[task_id]
+                    return
+
+                skill = self._skills.get_skill(step.skill_name)  # guaranteed registered - checked before the pause
+                resolved_args = state.pending_args[paused_index]
+                self._mark_item(task, paused_index, status="in_progress")
+                task.status = "running"
                 task.pending_input = None
-                task.result = {
-                    "error": (
-                        f"step {paused_index} ('{step.skill_name}') was rejected by the "
-                        "operator; task aborted"
+                await session.commit()
+
+                _logger.info("skill_execution_started", skill=skill.name, step=paused_index, task_id=task_id)
+                try:
+                    with start_span("skill.execute", skill=skill.name, step=paused_index):
+                        output = await skill.run(**resolved_args)
+                except Exception as exc:  # noqa: BLE001 - a skill's own failure, not swallowed (spec §12)
+                    _logger.error(
+                        "skill_execution_failed", skill=skill.name, step=paused_index,
+                        task_id=task_id, error=str(exc),
                     )
-                }
+                    self._mark_item(task, paused_index, status="failed", reason=str(exc))
+                    task.status = "failed"
+                    task.result = {"error": f"step {paused_index} ('{step.skill_name}') failed: {exc}"}
+                    await session.commit()
+                    del self._active[task_id]
+                    return
+                _logger.info("skill_execution_completed", skill=skill.name, step=paused_index, task_id=task_id)
+
+                state.results[paused_index] = output
+                state.paused_index = None
+                self._mark_item(task, paused_index, status="completed")
                 await session.commit()
-                del self._active[task_id]
-                return
-
-            skill = self._skills.get_skill(step.skill_name)  # guaranteed registered - checked before the pause
-            resolved_args = state.pending_args[paused_index]
-            self._mark_item(task, paused_index, status="in_progress")
-            task.status = "running"
-            task.pending_input = None
-            await session.commit()
-
-            try:
-                output = await skill.run(**resolved_args)
-            except Exception as exc:  # noqa: BLE001 - a skill's own failure, not swallowed (spec §12)
-                self._mark_item(task, paused_index, status="failed", reason=str(exc))
-                task.status = "failed"
-                task.result = {"error": f"step {paused_index} ('{step.skill_name}') failed: {exc}"}
-                await session.commit()
-                del self._active[task_id]
-                return
-
-            state.results[paused_index] = output
-            state.paused_index = None
-            self._mark_item(task, paused_index, status="completed")
-            await session.commit()
 
         await self._advance(task_id)
 
@@ -276,17 +320,21 @@ class Orchestrator:
             task = await session.get(Task, task_id)
             assert task is not None
 
-            for level_pos in range(state.next_level, len(state.levels)):
-                outcome = await self._process_level(session, task, state, level_pos)
-                if outcome in ("paused", "failed"):
-                    if outcome == "failed":
-                        del self._active[task_id]
-                    return
-                state.next_level = level_pos + 1
+            with bind_correlation_id(task.correlation_id):
+                with start_span("orchestrator.advance", task_id=task_id):
+                    for level_pos in range(state.next_level, len(state.levels)):
+                        outcome = await self._process_level(session, task, state, level_pos)
+                        if outcome in ("paused", "failed"):
+                            _logger.info("task_advance_stopped", task_id=task_id, outcome=outcome)
+                            if outcome == "failed":
+                                del self._active[task_id]
+                            return
+                        state.next_level = level_pos + 1
 
-            task.status = "completed"
-            task.result = self._build_result(state, task.checklist)
-            await session.commit()
+                    task.status = "completed"
+                    task.result = self._build_result(state, task.checklist)
+                    await session.commit()
+                _logger.info("task_completed", task_id=task_id)
         del self._active[task_id]
 
     async def _synthesize_missing_skill(
@@ -304,6 +352,7 @@ class Orchestrator:
         `"failed"` right after calling this)."""
         message = f"no skill named '{step.skill_name}' is registered"
         if self._capability_factory is None:
+            _logger.warning("skill_not_registered_no_factory", skill=step.skill_name, step=index)
             self._mark_item(task, index, status="skipped", reason=message)
             task.status = "failed"
             task.result = {"error": f"step {index}: {message}"}
@@ -316,12 +365,23 @@ class Orchestrator:
             "Synthesize a skill that fulfills this need, accepting exactly those keyword "
             "argument names."
         )
+        _logger.info("capability_synthesis_triggered", skill=step.skill_name, step=index, task_id=task.id)
         try:
             return await self._capability_factory.synthesize(
                 need_description=need_description, task_id=task.id
             )
-        except SynthesisValidationError as exc:
+        except (SynthesisValidationError, SandboxViolationError) as exc:
+            # Both are surfaced identically at the Orchestrator level
+            # (spec §12): a validation failure exhausts its own bounded
+            # retry inside the Factory; a sandbox violation (e.g. an
+            # OOM-killed synthesis attempt) is never retried by the
+            # Factory at all - either way, this step - and the task -
+            # fails with the real detail, never silently.
             failure = f"{message}; capability synthesis also failed: {exc}"
+            _logger.error(
+                "capability_synthesis_failed", skill=step.skill_name, step=index,
+                task_id=task.id, error=str(exc),
+            )
             self._mark_item(task, index, status="failed", reason=failure)
             task.status = "failed"
             task.result = {"error": f"step {index}: {failure}"}
@@ -336,7 +396,22 @@ class Orchestrator:
         if not todo:
             return "ok"
 
+        # Tool-result cache (spec §11: "idempotent read-only calls within
+        # a single task") - `state.tool_cache` lives exactly as long as
+        # this one task. Only `read_only` skills are ever cached (a
+        # `mutating` skill's call is never assumed idempotent, and each
+        # one already pauses for its own individual approval). A cache
+        # hit resolves the step immediately, with no execution at all.
+        # Two-or-more steps sharing the same (skill, args) that are BOTH
+        # still cache misses in this same level are deduplicated here
+        # too (`aliases`) - only the first ("runner") actually calls
+        # `skill.run()`; the rest copy its outcome once it completes,
+        # rather than each racing to miss the cache concurrently.
         run_plan: dict[int, tuple[Skill, dict[str, Any]]] = {}
+        cache_keys: dict[int, str] = {}
+        runner_for_key: dict[str, int] = {}
+        aliases: dict[int, int] = {}
+
         for index in todo:
             step = state.steps[index]
             resolved_args = resolve_args(step.args, state.results)
@@ -363,6 +438,21 @@ class Orchestrator:
                 state.pending_args[index] = resolved_args
                 return "paused"
 
+            if skill.risk == "read_only":
+                cache_key = _tool_result_cache_key(skill.name, resolved_args)
+                cached_result = await state.tool_cache.get(cache_key)
+                if cached_result is not None:
+                    _logger.info("tool_result_cache_hit", skill=skill.name, step=index, task_id=task.id)
+                    state.results[index] = cached_result
+                    self._mark_item(task, index, status="completed")
+                    continue
+                if cache_key in runner_for_key:
+                    aliases[index] = runner_for_key[cache_key]
+                    cache_keys[index] = cache_key
+                    continue
+                runner_for_key[cache_key] = index
+                cache_keys[index] = cache_key
+
             run_plan[index] = (skill, resolved_args)
 
         for index in run_plan:
@@ -371,10 +461,18 @@ class Orchestrator:
 
         async def _run_one(index: int) -> tuple[int, Any, BaseException | None]:
             skill, args = run_plan[index]
+            _logger.info("skill_execution_started", skill=skill.name, step=index, task_id=task.id)
             try:
-                return index, await skill.run(**args), None
+                with start_span("skill.execute", skill=skill.name, step=index):
+                    result = await skill.run(**args)
             except Exception as exc:  # noqa: BLE001 - captured per-step, not swallowed (spec §12)
+                _logger.error(
+                    "skill_execution_failed", skill=skill.name, step=index,
+                    task_id=task.id, error=str(exc),
+                )
                 return index, None, exc
+            _logger.info("skill_execution_completed", skill=skill.name, step=index, task_id=task.id)
+            return index, result, None
 
         outcomes = await asyncio.gather(*(_run_one(index) for index in run_plan))
 
@@ -386,6 +484,23 @@ class Orchestrator:
             else:
                 state.results[index] = output
                 self._mark_item(task, index, status="completed")
+                cache_key = cache_keys.get(index)
+                if cache_key is not None:
+                    await state.tool_cache.set(cache_key, output)
+
+        # Propagate each runner's outcome to every alias sharing its
+        # (skill, args) signature within this same level.
+        for alias_index, runner_index in aliases.items():
+            if runner_index in state.results:
+                state.results[alias_index] = state.results[runner_index]
+                self._mark_item(task, alias_index, status="completed")
+            else:
+                reason = next(
+                    (str(exc) for index, _, exc in outcomes if index == runner_index and exc is not None),
+                    "a duplicate step sharing this skill/args failed",
+                )
+                self._mark_item(task, alias_index, status="failed", reason=reason)
+                any_failed = True
         await session.commit()
 
         if any_failed:

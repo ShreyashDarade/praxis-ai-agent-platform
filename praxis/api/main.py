@@ -1,20 +1,26 @@
 """FastAPI application entrypoint (spec §14)."""
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import structlog
 from docker.errors import DockerException
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from praxis.agents import skill_registry
 from praxis.agents.capability_factory import CapabilityFactory
 from praxis.agents.planner import Planner
+from praxis.agents.scheduler import Scheduler
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
 from praxis.connectors.registry import ConnectorRegistry
+from praxis.core.exceptions import ApprovalTimeoutError
 from praxis.core.interfaces import HealthStatus
 from praxis.core.orchestrator import Orchestrator
 from praxis.ingestion.embedders.sentence_transformer_embedder import get_default_embedder
@@ -25,9 +31,19 @@ from praxis.llm.prompt_manager import PromptManager
 from praxis.memory.blob_store import LocalBlobStore
 from praxis.memory.db import PostgresStore
 from praxis.memory.graph_store import PgGraphStore
-from praxis.memory.models import Task
+from praxis.memory.models import HealthRecord, Task
 from praxis.memory.vector_store import PgVectorStore
+from praxis.observability.logging import configure_logging
+from praxis.observability.tracing import configure_tracing
 from praxis.sandbox.executor import DockerSandboxExecutor
+
+# Observability (spec §10) - configured once, at import time, before
+# anything else in this module can possibly log or open a span; both
+# are idempotent, mirroring parser_registry.discover_parsers()'s own
+# "safe to call repeatedly" posture below.
+configure_logging()
+configure_tracing()
+_logger = structlog.get_logger(__name__)
 
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "agents" / "skills"
 
@@ -96,14 +112,28 @@ for _connector_health_check in _build_connector_registry().all_health_checks():
     register_health_check(_connector_health_check)
 
 
-@app.get("/health")
-async def health() -> JSONResponse:
+async def run_health_checks() -> list[HealthStatus]:
+    """The one, real health-check aggregation - runs every registered
+    `HEALTH_CHECKS` entry, isolating a check that raises rather than
+    letting it take down the whole aggregation. Shared by `/health`
+    (below) and the scheduled health scan (`record_health_scan`, spec
+    §18) - deliberately the *same* function, not two copies of this
+    loop, so the on-demand and the scheduled view of "what's healthy"
+    can never silently drift apart (spec §10: "`GET /health` plus the
+    `HealthMonitor` ... exposed both on-demand and on schedule").
+    """
     results = []
     for check in HEALTH_CHECKS:
         try:
             results.append(await check())
         except Exception as exc:  # noqa: BLE001 - one bad check must not take down /health
             results.append(HealthStatus(name=check.__name__, healthy=False, detail=str(exc)))
+    return results
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    results = await run_health_checks()
 
     overall = all(r.healthy for r in results)
     body = {
@@ -113,6 +143,138 @@ async def health() -> JSONResponse:
         ],
     }
     return JSONResponse(content=body, status_code=200 if overall else 503)
+
+
+# ------------------------------------------------------------------ #
+# Scheduled agents (spec §7, §10, §12, §18): a real health scan and a
+# real approval-timeout sweep, both registered with
+# `praxis.agents.scheduler.Scheduler` below, at this module's own
+# import time - mirroring `parser_registry.discover_parsers()` and
+# `skill_registry.discover_skills()`'s own "wired in at module-level
+# setup" posture.
+# ------------------------------------------------------------------ #
+
+
+async def record_health_scan() -> list[HealthStatus]:
+    """The §18 scheduled health scan: runs `run_health_checks()` - the
+    exact same aggregation `/health` uses, never a duplicate - then
+    writes one `HealthRecord` row per component to the real database,
+    which is what a future Observability view (§10) reads as health
+    history. Returns the results too, so a test (or any other caller
+    wanting the outcome without waiting on the scheduler) can call this
+    directly and inspect exactly what happened.
+    """
+    results = await run_health_checks()
+
+    settings = Settings()
+    store = PostgresStore(settings)
+    try:
+        async with store.session() as session:
+            for result in results:
+                session.add(
+                    HealthRecord(component=result.name, healthy=result.healthy, detail=result.detail)
+                )
+            await session.commit()
+    finally:
+        await store.dispose()
+
+    _logger.info(
+        "health_scan_completed",
+        components=len(results),
+        healthy=all(r.healthy for r in results),
+    )
+    return results
+
+
+async def sweep_stale_approvals() -> list[str]:
+    """The approval-timeout sweep (spec §12's `ApprovalTimeoutError`):
+    finds every `Task` still `awaiting_approval`/`awaiting_clarification`
+    whose `updated_at` is older than `Settings.approval_timeout_seconds`,
+    marks each one `failed` with the error's detail recorded in
+    `Task.result` - surfaced to the user via `GET /tasks/{id}`, never
+    silently left paused forever (spec §12) - and logs it. Returns the
+    swept task ids, so a test (or the sync job wrapper below) can
+    inspect the real outcome.
+    """
+    settings = Settings()
+    store = PostgresStore(settings)
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=settings.approval_timeout_seconds)
+    swept: list[str] = []
+    try:
+        async with store.session() as session:
+            stmt = select(Task).where(
+                Task.status.in_(["awaiting_approval", "awaiting_clarification"]),
+                Task.updated_at < cutoff,
+            )
+            stale_tasks = (await session.execute(stmt)).scalars().all()
+
+            for task in stale_tasks:
+                waited_seconds = (datetime.now(timezone.utc) - task.updated_at).total_seconds()
+                error = ApprovalTimeoutError(
+                    f"task '{task.id}' was left '{task.status}' past the "
+                    f"{settings.approval_timeout_seconds}s approval timeout",
+                    task_id=task.id,
+                    waited_seconds=waited_seconds,
+                    detail=f"last updated at {task.updated_at.isoformat()}",
+                )
+                task.status = "failed"
+                task.pending_input = None
+                task.result = {"error": str(error)}
+                swept.append(task.id)
+                _logger.warning(
+                    "approval_timeout", task_id=task.id, waited_seconds=waited_seconds
+                )
+
+            await session.commit()
+    finally:
+        await store.dispose()
+
+    return swept
+
+
+def _health_scan_job() -> None:
+    # A plain sync callable APScheduler's BackgroundScheduler runs in its
+    # own worker thread - bridges to the real async job via a fresh
+    # asyncio.run(...), exactly like praxis.cli.init()'s own steps do for
+    # the same reason. Any failure is logged, never left to crash the
+    # scheduler's worker thread and silently take every future run of
+    # every other job down with it.
+    try:
+        asyncio.run(record_health_scan())
+    except Exception:  # noqa: BLE001
+        _logger.exception("health_scan_job_failed")
+
+
+def _approval_timeout_sweep_job() -> None:
+    try:
+        asyncio.run(sweep_stale_approvals())
+    except Exception:  # noqa: BLE001
+        _logger.exception("approval_timeout_sweep_job_failed")
+
+
+def _build_scheduler() -> Scheduler | None:
+    """Genuinely optional, degrades gracefully - same posture as
+    `_build_connector_registry` above: `Settings()` can fail (e.g.
+    during test collection, before any fixture has set env vars) and
+    that must not take this whole module's import down.
+    """
+    try:
+        settings = Settings()
+    except Exception:  # noqa: BLE001
+        return None
+
+    scheduler = Scheduler()
+    scheduler.add_interval_job(
+        _health_scan_job, settings.health_scan_interval_seconds, job_id="health_scan"
+    )
+    scheduler.add_interval_job(
+        _approval_timeout_sweep_job, settings.approval_timeout_seconds, job_id="approval_timeout_sweep"
+    )
+    scheduler.start()
+    return scheduler
+
+
+_scheduler = _build_scheduler()
 
 
 @app.post("/attachments", status_code=201)

@@ -33,6 +33,7 @@ from docker.errors import DockerException, ImageNotFound, NotFound
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout
 
+from praxis.core.exceptions import SandboxViolationError
 from praxis.core.interfaces import SandboxExecutor, SandboxResult
 
 # A small, pinned base image - not "python:3.11" or "python:latest",
@@ -131,6 +132,28 @@ class DockerSandboxExecutor(SandboxExecutor):
                 )
                 stdout = _decode(container.logs(stdout=True, stderr=False))
                 stderr = _decode(container.logs(stdout=False, stderr=True))
+
+                if _was_oom_killed(container):
+                    # A genuine resource-bound violation (spec §12) - not
+                    # "the user's code returned non-zero" (an ordinary
+                    # failure, still a plain SandboxResult below). Docker
+                    # itself reports this via the container's own real
+                    # inspect result (`State.OOMKilled`), never guessed
+                    # from the exit code alone (137 is also just "some
+                    # process was SIGKILLed", e.g. our own timeout-kill
+                    # branch below) - verified directly against a real
+                    # container that actually over-allocated past its
+                    # `mem_limit` while building this.
+                    raise SandboxViolationError(
+                        f"sandboxed execution in container '{container_name}' exceeded its "
+                        f"memory bound (mem_limit={self._mem_limit}) and was OOM-killed",
+                        violation="oom_killed",
+                        exit_code=exit_code,
+                        detail=(
+                            f"Docker reported State.OOMKilled=true, exit_code={exit_code}; "
+                            f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                        ),
+                    )
                 return SandboxResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
             except (ReadTimeout, RequestsConnectionError):
                 # The container genuinely did not finish within
@@ -150,6 +173,23 @@ class DockerSandboxExecutor(SandboxExecutor):
                 container.remove(force=True)
             except (NotFound, DockerException):
                 pass
+
+
+def _was_oom_killed(container: Any) -> bool:
+    """Real detection, not a guess: refreshes the container's own state
+    (`container.reload()`) and reads Docker's own `State.OOMKilled`
+    field - the authoritative signal the daemon itself sets the moment
+    the kernel's cgroup OOM killer terminates a container for exceeding
+    its `mem_limit`. Deliberately does not treat exit code 137 alone as
+    sufficient (that's just "some process got SIGKILLed" - e.g. this
+    same module's own timeout-triggered `container.kill()` below also
+    produces 137, and is *not* a resource violation).
+    """
+    try:
+        container.reload()
+    except DockerException:
+        return False
+    return bool(container.attrs.get("State", {}).get("OOMKilled", False))
 
 
 def _decode(raw: bytes) -> str:

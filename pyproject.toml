@@ -53,6 +53,17 @@ dependencies = [
     # is built on - pinned to the version actually resolved and verified
     # in this venv, same discipline as every other pin above.
     "docker>=7.2,<8.0",
+    # Phase 7 (Observability, Caching, Exception taxonomy, Scheduled
+    # agents; spec §7, §10, §11, §12, §18). `apscheduler` backs
+    # `praxis/agents/scheduler.py`'s `Scheduler` (the health-scan and
+    # approval-timeout-sweep jobs registered in `praxis/api/main.py`).
+    # `opentelemetry-sdk`/`-api` back `praxis/observability/tracing.py`'s
+    # `TracerProvider` + `ConsoleSpanExporter` (spec §10's "local
+    # exporter for MVP"). Each pinned to the version actually resolved
+    # and verified in this venv, same discipline as every pin above.
+    "apscheduler>=3.10,<4.0",
+    "opentelemetry-sdk>=1.27,<2.0",
+    "opentelemetry-api>=1.27,<2.0",
 ]
 
 # Windows-only caveat, discovered and fixed while verifying this exact
