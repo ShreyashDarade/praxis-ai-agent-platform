@@ -47,6 +47,12 @@ dependencies = [
     # now a direct dependency of PromptManager - declared explicitly at
     # the version already installed and verified working.
     "jinja2>=3.1.6,<4.0",
+    # Phase 5 (Orchestrator, Planner, execution graph, risk policy,
+    # sandbox executor; spec §3, §7, §8). `docker` is the official
+    # docker-py SDK `praxis/sandbox/executor.py`'s `DockerSandboxExecutor`
+    # is built on - pinned to the version actually resolved and verified
+    # in this venv, same discipline as every other pin above.
+    "docker>=7.2,<8.0",
 ]
 
 # Windows-only caveat, discovered and fixed while verifying this exact

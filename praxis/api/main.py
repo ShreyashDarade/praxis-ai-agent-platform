@@ -5,16 +5,23 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
+from praxis.agents import skill_registry
+from praxis.agents.planner import Planner
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
 from praxis.connectors.registry import ConnectorRegistry
 from praxis.core.interfaces import HealthStatus
-from praxis.ingestion.embedders.sentence_transformer_embedder import SentenceTransformerEmbedder
+from praxis.core.orchestrator import Orchestrator
+from praxis.ingestion.embedders.sentence_transformer_embedder import get_default_embedder
 from praxis.ingestion.parsers import registry as parser_registry
 from praxis.ingestion.pipeline import ingest
+from praxis.llm.catalogue import LLMCatalogue
+from praxis.llm.prompt_manager import PromptManager
 from praxis.memory.blob_store import LocalBlobStore
 from praxis.memory.db import PostgresStore
+from praxis.memory.models import Task
 from praxis.memory.vector_store import PgVectorStore
 
 app = FastAPI(title="Praxis")
@@ -25,12 +32,19 @@ app = FastAPI(title="Praxis")
 # via `build_registry`. Safe to call repeatedly (idempotent).
 parser_registry.discover_parsers()
 
+# Same discovery pattern, for the two hand-written skills this phase
+# ships (spec §7; praxis/agents/skills/) - one new file with a
+# `register_skill(...)` call is how skill #3 gets added, not an edit
+# here.
+skill_registry.discover_skills()
+
 # Loading the sentence-transformers model is expensive (first use may
-# download weights) - build it once here, at module level, rather than
-# per-request inside `upload_attachment` below (spec §5 step 5's
-# environment note; mirrors SentenceTransformerEmbedder's own
-# load-once-at-construction discipline).
-_embedder = SentenceTransformerEmbedder()
+# download weights) - force it to load once here, at module level,
+# rather than on the first request. `get_default_embedder()` (not a
+# fresh `SentenceTransformerEmbedder()`) so this process's one loaded
+# model is shared with `praxis.agents.skills.retrieve_documents`
+# (Phase 5) instead of each loading its own copy.
+_embedder = get_default_embedder()
 
 # Later phases append connector/sandbox checks here - OCP, mirrors cli.py's INIT_STEPS.
 HealthCheck = Callable[[], Awaitable[HealthStatus]]
@@ -155,3 +169,123 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
         response["summary"] = attachment_id.summary
         response["topics"] = attachment_id.topics or []
     return response
+
+
+# Orchestrator wiring (spec §3, §14). Unlike `upload_attachment`'s
+# per-request `PostgresStore`, this is a true module-level singleton,
+# constructed lazily (not at import time, for the same "Settings() may
+# not be configured yet" reason `_build_connector_registry` defers)
+# but memoized thereafter: `Orchestrator` holds in-memory execution-
+# graph state (`praxis.core.orchestrator._TaskState`) across requests -
+# a task pausing to `awaiting_approval` on one request and being
+# resumed by a later `POST /tasks/{id}/approve` request must reach the
+# *same* Orchestrator instance, not a fresh one per call.
+_orchestrator: Orchestrator | None = None
+
+
+def _get_orchestrator() -> Orchestrator:
+    global _orchestrator
+    if _orchestrator is None:
+        settings = Settings()
+        store = PostgresStore(settings)
+        planner = Planner(LLMCatalogue(), PromptManager())
+        _orchestrator = Orchestrator(store, planner, skill_registry)
+    return _orchestrator
+
+
+class IntentRequest(BaseModel):
+    text: str
+
+
+class ApproveRequest(BaseModel):
+    approved: bool
+
+
+class ClarifyRequest(BaseModel):
+    answer: str
+
+
+@app.post("/intent", status_code=201)
+async def create_intent(body: IntentRequest) -> dict[str, Any]:
+    """Ad-hoc ask -> a new `Task`, run through the Orchestrator (spec §14)."""
+    orchestrator = _get_orchestrator()
+    task_id = await orchestrator.start_task(body.text)
+    return {"task_id": task_id}
+
+
+@app.get("/tasks/{task_id}")
+async def get_task(task_id: str) -> dict[str, Any]:
+    """Task status/result, including the live checklist and any pending
+    approval/clarification detail (spec §7, §9, §14)."""
+    settings = Settings()
+    store = PostgresStore(settings)
+    try:
+        async with store.session() as session:
+            task = await session.get(Task, task_id)
+    finally:
+        await store.dispose()
+
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
+
+    return {
+        "status": task.status,
+        "checklist": task.checklist,
+        "pending_input": task.pending_input,
+        "result": task.result,
+    }
+
+
+@app.post("/tasks/{task_id}/approve")
+async def approve_task(task_id: str, body: ApproveRequest) -> dict[str, Any]:
+    """Resumes a mutating task paused on approval (spec §8, §14 - the interrupt)."""
+    orchestrator = _get_orchestrator()
+    try:
+        await orchestrator.resume_after_approval(task_id, body.approved)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        # Not currently awaiting approval (wrong status, unknown to this
+        # process, ...) - a conflict with the resource's current state,
+        # not a missing resource or a bad request body.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"task_id": task_id}
+
+
+@app.post("/tasks/{task_id}/clarify")
+async def clarify_task(task_id: str, body: ClarifyRequest) -> dict[str, Any]:
+    """Answers a pending `ClarificationRequest` and resumes (spec §8, §14).
+
+    Nothing in this phase's scope ever raises a `ClarificationRequest`
+    (no Planner-side clarification logic is required yet - see the
+    phase brief's scope note): this endpoint is still a real,
+    contract-correct implementation rather than an omission - it
+    validates the task exists and is genuinely `awaiting_clarification`
+    before doing anything, exactly like `approve_task` above. It simply
+    has no caller in this phase that ever reaches that state, so its
+    "success" path (clearing the pause and recording the answer) stays
+    real but untested-via-a-live-caller until a later phase's Planner/
+    Factory actually raises one.
+    """
+    settings = Settings()
+    store = PostgresStore(settings)
+    try:
+        async with store.session() as session:
+            task = await session.get(Task, task_id)
+            if task is None:
+                raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
+            if task.status != "awaiting_clarification":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"task '{task_id}' is not awaiting clarification "
+                        f"(status: '{task.status}')"
+                    ),
+                )
+            task.pending_input = None
+            task.status = "running"
+            task.result = {**(task.result or {}), "clarification_answer": body.answer}
+            await session.commit()
+    finally:
+        await store.dispose()
+    return {"task_id": task_id}

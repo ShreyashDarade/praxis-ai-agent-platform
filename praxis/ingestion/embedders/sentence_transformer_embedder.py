@@ -37,3 +37,24 @@ class SentenceTransformerEmbedder(Embedder):
         # so embedding a batch doesn't block other async work.
         vectors = await asyncio.to_thread(self._model.encode, texts)
         return [vector.tolist() for vector in vectors]
+
+
+_default_instance: SentenceTransformerEmbedder | None = None
+
+
+def get_default_embedder() -> SentenceTransformerEmbedder:
+    """A process-wide, lazily-constructed `SentenceTransformerEmbedder` singleton.
+
+    Every caller that just wants "the" default embedder - `praxis.api.main`'s
+    `/attachments` handler and `praxis.agents.skills.retrieve_documents`'s
+    skill alike (Phase 5) - should call this rather than each
+    constructing its own `SentenceTransformerEmbedder()`: loading the
+    model is expensive, and two independent module-level instances would
+    silently load the same weights twice for no benefit. Callers that
+    genuinely need an isolated instance (e.g. a test forcing a specific
+    `model_name`) still construct `SentenceTransformerEmbedder(...)` directly.
+    """
+    global _default_instance
+    if _default_instance is None:
+        _default_instance = SentenceTransformerEmbedder()
+    return _default_instance

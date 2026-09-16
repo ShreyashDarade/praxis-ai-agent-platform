@@ -22,12 +22,47 @@ class Base(DeclarativeBase):
 
 
 class Task(Base):
+    """A task moving through the Orchestrator (Phase 5, spec §3/§7/§8/§9/§14).
+
+    `status` stays a plain string column (no DB-level enum, matching the
+    rest of this schema's style) but its value set is now:
+    `pending` (row created, not yet planned) -> `planning` (Planner is
+    decomposing the intent) -> `running` (executing the plan) ->
+    `awaiting_approval` | `awaiting_clarification` (paused on a
+    `PendingInput`, see `praxis.core.risk_policy.PendingInput`) ->
+    `completed` | `failed` (terminal).
+
+    `checklist` is the materialized plan (spec §7's "every step becomes
+    a visible checklist item"): a list of
+    `{"content": str, "status": "pending"|"in_progress"|"completed"|"skipped",
+    "reason": str | None}` dicts, one per `PlanStep`, mutated (via
+    reassignment, never in-place - see `Orchestrator._mark_item`) by the
+    Orchestrator as execution proceeds - this is what `GET /tasks/{id}`
+    (§14) renders as real progress, never a heuristic percentage. A
+    mutating step's item also transiently reads `"awaiting_approval"`
+    while the task itself is paused on it, mirroring the task-level
+    status below (`Orchestrator._process_level`).
+
+    `pending_input` is `None` except while the task is paused, in which
+    case it holds the `PendingInput` this task is waiting on, serialized
+    as `{"kind": "approval"|"clarification", "detail": str,
+    "options": list[str] | None}`.
+
+    `result` is `None` until the task reaches a terminal status, then
+    holds the final delivered output (a short structured summary of what
+    happened plus each step's output for `completed`, or a clear failure
+    message for `failed`).
+    """
+
     __tablename__ = "tasks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     correlation_id: Mapped[str] = mapped_column(String(36), default=_uuid)
     intent_text: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="pending")
+    checklist: Mapped[list] = mapped_column(JSON, default=list)
+    pending_input: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
