@@ -15,6 +15,16 @@ dependencies = [
     "structlog>=24.4",
     "typer>=0.13",
     "slack-sdk>=3.33",
+    "unstructured[pdf,docx]>=0.27,<0.28",
+    "pytesseract>=0.3.13,<0.4",
+    "pypdfium2>=5.0,<6.0",
+    "pandas>=2.2,<3.0",
+    "sentence-transformers>=3.3,<7.0",
+    "langchain-text-splitters>=0.3,<2.0",
+    "pillow>=10.4",
+    "openpyxl>=3.1,<4.0",
+    "python-multipart>=0.0.9",
+    "mcp>=1.29",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +37,11 @@ dev = [
     # intercept it) - aioresponses mocks aiohttp the same way respx
     # mocks httpx, used only for SlackConnector's tests.
     "aioresponses>=0.7",
+    # Async SQLite driver for SQLAlchemy's async engine - lets
+    # SQLConnector's tests prove dialect-agnosticism against a real,
+    # genuinely different dialect than Postgres, with zero external
+    # service required.
+    "aiosqlite>=0.20",
 ]
 
 [project.scripts]

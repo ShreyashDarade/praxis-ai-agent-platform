@@ -20,11 +20,22 @@ Adding connector #5 is entirely one new file:
 ending with a `register_connector_factory(...)` call. Nothing in this
 file, or any other core file, changes.
 
-The generic PostgresConnector is deliberately not part of this
-self-registering set: per spec §6/§16.2, "connect to any Postgres DB"
-has no single global DSN to gate a factory on, so registering one is
-left to whoever actually needs it (a later phase's task, or a test) -
-see `praxis.connectors.postgres.connector`'s docstring.
+The generic PostgresConnector (and, for the same reason, the
+dialect-agnostic SQLConnector) is deliberately not part of this
+self-registering set: per spec §6/§16.2, "connect to any [Postgres/SQL]
+DB" has no single global DSN to gate a factory on, so registering one
+is left to whoever actually needs it (a later phase's task, or a test)
+- see `praxis.connectors.postgres.connector`'s and
+`praxis.connectors.sql.connector`'s docstrings.
+
+Universal MCP connectors are a second, separate registration pass,
+below - genuinely data-driven (a for-loop over `settings.mcp_servers`),
+not the self-registering-factory pattern, because a factory is
+one-per-connector-*type* ("is this type configured at all") while an
+MCP server entry is one-per-*instance* (a deployment may want several,
+each with its own name/command/url). `MCPConnector` itself never calls
+`register_connector_factory` - see
+`praxis.connectors.mcp.connector`'s docstring.
 """
 from __future__ import annotations
 
@@ -34,6 +45,7 @@ import pkgutil
 import praxis.connectors as _connectors_pkg
 from praxis.config import Settings
 from praxis.connectors import factory
+from praxis.connectors.mcp.connector import MCPConnector
 from praxis.connectors.registry import ConnectorRegistry
 
 _DISCOVERED = False
@@ -70,4 +82,19 @@ def build_registry(settings: Settings) -> ConnectorRegistry:
     for connector_factory in factory.all_factories():
         if connector_factory.is_configured(settings):
             registry.register(connector_factory.build(settings))
+
+    # Second, separate pass: one MCPConnector per configured
+    # `MCPServerConfig` entry. Genuinely data-driven - a for-loop over a
+    # list - so registering server #2, #3, ... never touches this
+    # function again, same "no core code change" property the
+    # self-registering factories above give the four Phase 2 connectors.
+    for server in settings.mcp_servers:
+        registry.register(
+            MCPConnector(
+                name=server.name,
+                command=server.command,
+                args=server.args,
+                url=server.url,
+            )
+        )
     return registry

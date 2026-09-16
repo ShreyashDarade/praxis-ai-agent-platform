@@ -1,8 +1,28 @@
 """Deployment-wide settings (spec §2; §19 step 2 - config validation)."""
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class MCPServerConfig(BaseModel):
+    """One entry in ``Settings.mcp_servers``: everything needed to build one
+    ``MCPConnector`` (spec §6's "register it as an MCP server ... no core
+    code change").
+
+    A pydantic ``BaseModel`` (not a dataclass) so pydantic-settings can
+    parse a whole list of these straight out of a JSON-encoded env var.
+    Exactly one of ``command`` (stdio) or ``url`` (HTTP/SSE) is expected
+    to be set per entry - the same validation
+    ``praxis.connectors.mcp.connector.MCPConnector.__init__`` enforces
+    when `praxis.connectors.bootstrap.build_registry` constructs one
+    from this config.
+    """
+
+    name: str
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    url: str | None = None
 
 
 class Settings(BaseSettings):
@@ -33,4 +53,24 @@ class Settings(BaseSettings):
     )
     prometheus_url: str | None = Field(
         default=None, description="Base URL of a Prometheus server for PrometheusConnector"
+    )
+
+    # Universal MCP connectors (spec §6): each entry becomes one
+    # MCPConnector, registered by praxis.connectors.bootstrap.build_registry
+    # directly (not via the self-registering-factory mechanism the four
+    # Phase 2 connectors use, since one entry here is one *instance*, not
+    # one *type*). Setting, e.g.,
+    #   PRAXIS_MCP_SERVERS='[{"name": "example", "command": "npx", "args": ["-y", "some-mcp-server"]}]'
+    # registers that MCP server as a connector with zero code changes -
+    # the concrete proof that adding connector #N is a config entry, not
+    # a new Python class. Defaults to empty: no MCP servers configured.
+    # This is deliberately unlike the missing SQLConnector setting above:
+    # "any SQL DB" has no single global DSN, but "which MCP servers this
+    # deployment keeps connected" genuinely is a global, enumerable list
+    # - each entry names one specific, already-known server - so it
+    # belongs on Settings the way github_token/slack_bot_token/
+    # prometheus_url do, not left to per-task construction.
+    mcp_servers: list[MCPServerConfig] = Field(
+        default_factory=list,
+        description="MCP servers to register as connectors; see MCPServerConfig",
     )
