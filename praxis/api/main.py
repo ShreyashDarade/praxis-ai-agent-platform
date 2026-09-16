@@ -1,13 +1,16 @@
 """FastAPI application entrypoint (spec §14)."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from docker.errors import DockerException
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from praxis.agents import skill_registry
+from praxis.agents.capability_factory import CapabilityFactory
 from praxis.agents.planner import Planner
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
@@ -21,8 +24,12 @@ from praxis.llm.catalogue import LLMCatalogue
 from praxis.llm.prompt_manager import PromptManager
 from praxis.memory.blob_store import LocalBlobStore
 from praxis.memory.db import PostgresStore
+from praxis.memory.graph_store import PgGraphStore
 from praxis.memory.models import Task
 from praxis.memory.vector_store import PgVectorStore
+from praxis.sandbox.executor import DockerSandboxExecutor
+
+_SKILLS_DIR = Path(__file__).resolve().parent.parent / "agents" / "skills"
 
 app = FastAPI(title="Praxis")
 
@@ -183,13 +190,40 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
 _orchestrator: Orchestrator | None = None
 
 
+def _build_capability_factory(settings: Settings, store: PostgresStore) -> CapabilityFactory | None:
+    """Genuinely optional, degrades gracefully - same posture as
+    `_build_connector_registry` above and `praxis.connectors.bootstrap`
+    (spec §6's "degrades gracefully" applied to §19 step 5's sandbox
+    check): a `DockerSandboxExecutor` needs a real, reachable Docker
+    daemon, which isn't guaranteed in every deployment. When it isn't
+    reachable, the Orchestrator simply gets no `CapabilityFactory` and
+    falls back to its pre-Phase-6 behavior (an unregistered skill fails
+    the task immediately with a clear message) rather than this whole
+    endpoint failing to construct.
+    """
+    try:
+        sandbox = DockerSandboxExecutor(docker_host=settings.docker_host)
+    except DockerException:
+        return None
+    return CapabilityFactory(
+        LLMCatalogue(),
+        PromptManager(),
+        sandbox,
+        PgGraphStore(store),
+        store,
+        _SKILLS_DIR,
+        sandbox_timeout_seconds=settings.sandbox_timeout_seconds,
+    )
+
+
 def _get_orchestrator() -> Orchestrator:
     global _orchestrator
     if _orchestrator is None:
         settings = Settings()
         store = PostgresStore(settings)
         planner = Planner(LLMCatalogue(), PromptManager())
-        _orchestrator = Orchestrator(store, planner, skill_registry)
+        capability_factory = _build_capability_factory(settings, store)
+        _orchestrator = Orchestrator(store, planner, skill_registry, capability_factory)
     return _orchestrator
 
 

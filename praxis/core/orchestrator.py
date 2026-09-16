@@ -1,10 +1,32 @@
 # praxis/core/orchestrator.py
 """The Orchestrator (spec §3, §7, §8, §9, §14): turns a `Task`'s intent
 into a materialized checklist and drives it through the execution
-graph, pausing for approval on any `mutating` step and stopping hard on
-a step naming a skill this phase doesn't know (Phase 6's synthesis
-scope, not this one's - see the module-level scope note in the phase
-brief).
+graph, pausing for approval on any `mutating` step.
+
+**Capability synthesis (Phase 6, spec §3's "NO MATCH -> synthesize")**:
+when a `PlanStep` names a skill that isn't registered, and a
+`CapabilityFactory` was actually supplied (see `capability_factory`
+below), the Orchestrator asks it to synthesize one - real sandbox
+validation and all (`praxis.agents.capability_factory`) - before giving
+up. Per spec §8/§20, synthesis itself is never gated behind approval
+(only a *mutating* skill's actual execution is, exactly the same as any
+hand-written skill); if synthesis fails validation
+(`SynthesisValidationError`), the step - and the task - fails with the
+real detail, never silently. When no `CapabilityFactory` is supplied
+(the default - e.g. every pre-Phase-6 test in this file, and any
+deployment without Docker reachable), the old behavior holds exactly:
+an unregistered skill fails the task immediately, with a clear message.
+
+**An honest gap, not a heuristic (see the phase report)**: synthesis
+triggered from here is never given a `connector` - the Planner (§7)
+doesn't currently produce any signal for "this step is about connector
+X," so there is no principled way for the Orchestrator to guess one
+without inventing a fake heuristic. `CapabilityFactory.synthesize`
+still fully supports connector-aware synthesis (schema introspection +
+caching, lineage edges) for a caller that *does* know the connector -
+see `praxis.agents.capability_factory`'s own tests - this is specifically
+about what the Orchestrator itself can determine from a bare
+`PlanStep`, which today is nothing.
 
 **Short-term vs. long-term state (spec §9)**: the execution graph's
 live state (`_TaskState` - resolved levels, in-flight args, partial
@@ -40,6 +62,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from praxis.agents.planner import Planner
 from praxis.agents.skill import Skill
 from praxis.core.execution_graph import PlanStep, compute_levels, resolve_args
+from praxis.core.exceptions import SynthesisValidationError
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
 from praxis.memory.db import PostgresStore
 from praxis.memory.models import Task
@@ -54,6 +77,17 @@ class SkillRegistryLike(Protocol):
     def get_skill(self, name: str) -> Skill: ...
 
     def all_skills(self) -> list[Skill]: ...
+
+
+class CapabilityFactoryLike(Protocol):
+    """What the Orchestrator needs from a Capability Factory - satisfied
+    by the real `praxis.agents.capability_factory.CapabilityFactory`, or
+    any stand-in exposing the same one method in a test (mirrors
+    `SkillRegistryLike` above)."""
+
+    async def synthesize(
+        self, need_description: str, *, connector: Any | None = None, task_id: str | None = None
+    ) -> Skill: ...
 
 
 @dataclass
@@ -73,10 +107,17 @@ def _describe_step(step: PlanStep) -> str:
 
 
 class Orchestrator:
-    def __init__(self, store: PostgresStore, planner: Planner, skills: SkillRegistryLike) -> None:
+    def __init__(
+        self,
+        store: PostgresStore,
+        planner: Planner,
+        skills: SkillRegistryLike,
+        capability_factory: CapabilityFactoryLike | None = None,
+    ) -> None:
         self._store = store
         self._planner = planner
         self._skills = skills
+        self._capability_factory = capability_factory
         self._active: dict[str, _TaskState] = {}
 
     # ------------------------------------------------------------------ #
@@ -248,6 +289,45 @@ class Orchestrator:
             await session.commit()
         del self._active[task_id]
 
+    async def _synthesize_missing_skill(
+        self,
+        session: AsyncSession,
+        task: Task,
+        index: int,
+        step: PlanStep,
+        resolved_args: dict[str, Any],
+    ) -> Skill | None:
+        """Called from `_process_level` the moment `step.skill_name` isn't
+        registered. Returns the newly-synthesized `Skill` on success, or
+        `None` after already marking the step/task `failed` (mirroring
+        every other failure branch in `_process_level`, which returns
+        `"failed"` right after calling this)."""
+        message = f"no skill named '{step.skill_name}' is registered"
+        if self._capability_factory is None:
+            self._mark_item(task, index, status="skipped", reason=message)
+            task.status = "failed"
+            task.result = {"error": f"step {index}: {message}"}
+            await session.commit()
+            return None
+
+        need_description = (
+            f"A running plan needs a skill named '{step.skill_name}', to be called with "
+            f"keyword arguments {resolved_args!r} - no such skill is registered yet. "
+            "Synthesize a skill that fulfills this need, accepting exactly those keyword "
+            "argument names."
+        )
+        try:
+            return await self._capability_factory.synthesize(
+                need_description=need_description, task_id=task.id
+            )
+        except SynthesisValidationError as exc:
+            failure = f"{message}; capability synthesis also failed: {exc}"
+            self._mark_item(task, index, status="failed", reason=failure)
+            task.status = "failed"
+            task.result = {"error": f"step {index}: {failure}"}
+            await session.commit()
+            return None
+
     async def _process_level(
         self, session: AsyncSession, task: Task, state: _TaskState, level_pos: int
     ) -> str:
@@ -259,17 +339,13 @@ class Orchestrator:
         run_plan: dict[int, tuple[Skill, dict[str, Any]]] = {}
         for index in todo:
             step = state.steps[index]
+            resolved_args = resolve_args(step.args, state.results)
             try:
                 skill = self._skills.get_skill(step.skill_name)
             except KeyError:
-                message = f"no skill named '{step.skill_name}' is registered"
-                self._mark_item(task, index, status="skipped", reason=message)
-                task.status = "failed"
-                task.result = {"error": f"step {index}: {message}"}
-                await session.commit()
-                return "failed"
-
-            resolved_args = resolve_args(step.args, state.results)
+                skill = await self._synthesize_missing_skill(session, task, index, step, resolved_args)
+                if skill is None:
+                    return "failed"
 
             if should_pause_for_approval(skill):
                 pending = PendingInput(
