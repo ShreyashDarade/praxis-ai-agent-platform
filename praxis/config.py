@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     )
     sandbox_timeout_seconds: int = Field(default=30, ge=1, le=300)
 
+    # Local-filesystem `BlobStore` root (spec §2: "Local filesystem
+    # (scratch dir)" is the MVP-deployed backend). Has a default so its
+    # absence never blocks Settings() construction the way a missing
+    # database_url does - swapping to a different BlobStore backend
+    # (S3, GCS, ...) per spec §2's fsspec-based swap path is providing a
+    # different BlobStore implementation, not changing this setting's
+    # meaning.
+    blob_store_root: str = Field(
+        default="./data/attachments",
+        description="Local filesystem root directory for LocalBlobStore",
+    )
+
     # Optional connector credentials (spec §6, §19 step 4). Each is
     # genuinely optional: an unset value means that connector is simply
     # not registered (praxis.connectors.bootstrap.build_registry skips

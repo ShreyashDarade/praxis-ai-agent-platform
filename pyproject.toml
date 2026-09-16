@@ -22,17 +22,46 @@ dependencies = [
     # deliberate migration, rather than letting an unbounded >= pull a
     # breaking major on the next fresh install.
     "mcp>=1.29,<2.0",
+    # Phase 3 (Ingestion & RAG, spec §5). Each pin below is the version
+    # actually resolved and verified working together inside this
+    # project's isolated .venv (never the global Python - see the
+    # torch-poisoning note this replaced), not a bare unbounded ">=".
+    # `sentence-transformers` pulls in `torch` transitively - expected
+    # and fine here since it's contained to this clean venv.
+    "unstructured[pdf,docx]>=0.27,<0.28",
+    "pytesseract>=0.3.13,<0.4",
+    "pypdfium2>=5.13,<6.0",
+    "pandas>=3.0,<4.0",
+    "sentence-transformers>=6.0,<7.0",
+    "langchain-text-splitters>=1.1,<2.0",
+    "pillow>=12.3,<13.0",
+    "openpyxl>=3.1,<4.0",
 ]
 
-# Phase 3 (Ingestion & RAG) will need unstructured, pytesseract,
-# pypdfium2, pandas, sentence-transformers, langchain-text-splitters,
-# and pillow - deliberately not listed here yet. That draft attempt
-# pulled in a globally-broken torch DLL on this machine (unrelated to
-# Praxis's own code) that poisoned pytest's plugin autoload for every
-# test in the repo, not just the ones that need it. Re-add these when
-# Phase 3 is actually rebuilt, inside the isolated venv (see README /
-# .venv), so a fresh torch install there is never contaminated by
-# whatever else is on this machine's global Python.
+# Windows-only caveat, discovered and fixed while verifying this exact
+# venv (not a bug in Praxis's own code): `unstructured` unconditionally
+# requires `python-magic` (no extra gates it - confirmed via its own
+# METADATA), and `python-magic`'s ctypes binding to a system `libmagic`
+# DLL segfaults merely on `import magic` on this machine (Windows has no
+# native libmagic) - which crashes the whole process the instant
+# anything imports `unstructured.partition.auto` (it does
+# `importlib.import_module("magic")` at its own module level, inside a
+# try/except that catches ImportError but can't catch a native SIGSEGV).
+# Fix verified directly: `pip uninstall -y python-magic` and leave it
+# uninstalled - `unstructured`'s own fallback (the pure-Python `filetype`
+# package, already a transitive dependency) then takes over cleanly and
+# partition() works correctly (verified against real HTML). This can't
+# be expressed as a pyproject.toml pin (python-magic works fine, and is
+# preferable, on Linux/macOS - excluding it there would be a regression,
+# not a fix) - after `pip install -e .`/`pip install .` on Windows, run:
+#   .venv/Scripts/python.exe -m pip uninstall -y python-magic
+# Separately: `unstructured`'s own METADATA also restricts
+# `unstructured-inference` (real PDF layout-model partitioning) to
+# platform_system != 'Windows' (or Windows + Python 3.12 only) - so real
+# PDF partitioning via unstructured-inference is unavailable on this
+# Windows + Python 3.11 dev machine by unstructured's own upstream
+# design, not a Praxis bug. HTML/DOCX partitioning (and PDF on any other
+# supported platform) are unaffected.
 
 [project.optional-dependencies]
 dev = [

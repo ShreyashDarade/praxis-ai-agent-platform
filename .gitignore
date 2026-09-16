@@ -5,6 +5,9 @@ worktrees/
 # SDD scratch workspace (ledgers, briefs, review packages)
 .superpowers/
 
+# Local BlobStore default root (praxis/memory/blob_store.py, Settings.blob_store_root)
+/data/
+
 # Python
 __pycache__/
 *.py[cod]
