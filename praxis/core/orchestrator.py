@@ -65,6 +65,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from praxis.agents.planner import Planner
 from praxis.agents.skill import Skill
 from praxis.cache.memory_cache import InMemoryCache
+from praxis.core.events import TaskEventBus, task_event_bus, task_state_snapshot
 from praxis.core.execution_graph import PlanStep, compute_levels, resolve_args
 from praxis.core.exceptions import SandboxViolationError, SynthesisValidationError
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
@@ -140,12 +141,33 @@ class Orchestrator:
         planner: Planner,
         skills: SkillRegistryLike,
         capability_factory: CapabilityFactoryLike | None = None,
+        event_bus: TaskEventBus | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
         self._skills = skills
         self._capability_factory = capability_factory
+        # Defaults to the process-global bus (`praxis.core.events.
+        # task_event_bus`) - the same instance the `WS /tasks/{id}/
+        # stream` route subscribes to (praxis.api.main) - so every
+        # pre-existing caller (every test in this file included)
+        # continues to work unchanged, with live events simply
+        # published nowhere in particular unless something subscribes.
+        # A test wanting an isolated bus can still pass its own.
+        self._event_bus = event_bus if event_bus is not None else task_event_bus
         self._active: dict[str, _TaskState] = {}
+
+    async def _publish_state(self, task: Task) -> None:
+        """Publishes a live snapshot of `task` to any `WS /tasks/{id}/
+        stream` subscriber (spec §14) - called right after every commit
+        below that actually changes `status`/`checklist`/`pending_input`/
+        `result`, never as a periodic heartbeat. Safe to read `task`'s
+        attributes here, straight off the same ORM object just
+        committed, with no extra query - `PostgresStore`'s session
+        factory sets `expire_on_commit=False` (praxis/memory/db.py)
+        specifically so this kind of post-commit read never needs one.
+        """
+        await self._event_bus.publish(task.id, task_state_snapshot(task))
 
     # ------------------------------------------------------------------ #
     # Checklist helpers
@@ -219,6 +241,7 @@ class Orchestrator:
             task.checklist = checklist
             task.status = "running"
             await session.commit()
+        await self._publish_state(task)
 
         self._active[task_id] = _TaskState(steps=steps, levels=levels)
         await self._advance(task_id)
@@ -267,6 +290,7 @@ class Orchestrator:
                     }
                     _logger.info("task_rejected_by_operator", task_id=task_id, step=paused_index)
                     await session.commit()
+                    await self._publish_state(task)
                     del self._active[task_id]
                     return
 
@@ -276,6 +300,7 @@ class Orchestrator:
                 task.status = "running"
                 task.pending_input = None
                 await session.commit()
+                await self._publish_state(task)
 
                 _logger.info("skill_execution_started", skill=skill.name, step=paused_index, task_id=task_id)
                 try:
@@ -290,6 +315,7 @@ class Orchestrator:
                     task.status = "failed"
                     task.result = {"error": f"step {paused_index} ('{step.skill_name}') failed: {exc}"}
                     await session.commit()
+                    await self._publish_state(task)
                     del self._active[task_id]
                     return
                 _logger.info("skill_execution_completed", skill=skill.name, step=paused_index, task_id=task_id)
@@ -298,6 +324,7 @@ class Orchestrator:
                 state.paused_index = None
                 self._mark_item(task, paused_index, status="completed")
                 await session.commit()
+                await self._publish_state(task)
 
         await self._advance(task_id)
 
@@ -313,6 +340,7 @@ class Orchestrator:
             task.status = "failed"
             task.result = {"error": message}
             await session.commit()
+        await self._publish_state(task)
 
     async def _advance(self, task_id: str) -> None:
         state = self._active[task_id]
@@ -334,6 +362,7 @@ class Orchestrator:
                     task.status = "completed"
                     task.result = self._build_result(state, task.checklist)
                     await session.commit()
+                await self._publish_state(task)
                 _logger.info("task_completed", task_id=task_id)
         del self._active[task_id]
 
@@ -357,6 +386,7 @@ class Orchestrator:
             task.status = "failed"
             task.result = {"error": f"step {index}: {message}"}
             await session.commit()
+            await self._publish_state(task)
             return None
 
         need_description = (
@@ -386,6 +416,7 @@ class Orchestrator:
             task.status = "failed"
             task.result = {"error": f"step {index}: {failure}"}
             await session.commit()
+            await self._publish_state(task)
             return None
 
     async def _process_level(
@@ -434,6 +465,7 @@ class Orchestrator:
                 task.status = "awaiting_approval"
                 task.pending_input = pending.to_dict()
                 await session.commit()
+                await self._publish_state(task)
                 state.paused_index = index
                 state.pending_args[index] = resolved_args
                 return "paused"
@@ -458,6 +490,7 @@ class Orchestrator:
         for index in run_plan:
             self._mark_item(task, index, status="in_progress")
         await session.commit()
+        await self._publish_state(task)
 
         async def _run_one(index: int) -> tuple[int, Any, BaseException | None]:
             skill, args = run_plan[index]
@@ -502,10 +535,12 @@ class Orchestrator:
                 self._mark_item(task, alias_index, status="failed", reason=reason)
                 any_failed = True
         await session.commit()
+        await self._publish_state(task)
 
         if any_failed:
             task.status = "failed"
             task.result = {"error": "one or more steps failed", "checklist": task.checklist}
             await session.commit()
+            await self._publish_state(task)
             return "failed"
         return "ok"
