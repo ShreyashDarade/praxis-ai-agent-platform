@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -75,6 +76,26 @@ from praxis.observability.logging import bind_correlation_id
 from praxis.observability.tracing import start_span
 
 _logger = structlog.get_logger(__name__)
+
+# Phase 9 (spec §6.1's "prior-context-only fetch"): the Orchestrator is
+# the one place that decides which URLs are legitimate fetch targets for
+# `web_read`/`web_crawl` - never the skill/connector itself, and never
+# an LLM's own freshly-generated output. `_extract_urls` regex-extracts
+# every http(s) URL substring out of a piece of *already-validated*
+# text (the task's own intent text, or an earlier step's own result) -
+# deliberately permissive matching is safe here specifically because
+# every candidate this ever runs against already qualifies as "prior
+# context" by definition; over-matching only ever widens what a later
+# fetch is allowed to target with text that was already trusted input,
+# it never admits anything an LLM invented on its own. Trailing prose
+# punctuation commonly following a URL in natural-language text (a
+# period, comma, closing paren/bracket/quote) is stripped, since it's
+# never actually part of the URL.
+_URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
+
+
+def _extract_urls(text: str) -> set[str]:
+    return {match.rstrip(".,;:!?)]}'\"") for match in _URL_RE.findall(text)}
 
 
 class SkillRegistryLike(Protocol):
@@ -120,6 +141,14 @@ class _TaskState:
     paused_index: int | None = None
     pending_args: dict[int, dict[str, Any]] = field(default_factory=dict)
     tool_cache: InMemoryCache = field(default_factory=InMemoryCache)
+    # Phase 9 (spec §6.1): seeded from the task's own intent text in
+    # `start_task`, grown by `_merge_known_urls` every time a step's
+    # result is recorded below - passed into every skill call as the
+    # `known_urls` kwarg (see `_run_one` and `resume_after_approval`),
+    # which is exactly what `web_read`/`web_crawl` need to enforce
+    # "may only fetch a URL that already appears in validated task
+    # input or a prior tool result."
+    known_urls: set[str] = field(default_factory=set)
 
 
 def _describe_step(step: PlanStep) -> str:
@@ -186,6 +215,17 @@ class Orchestrator:
         task.checklist = checklist
 
     @staticmethod
+    def _merge_known_urls(state: _TaskState, value: Any) -> None:
+        """Grows `state.known_urls` from a just-recorded step result
+        (spec §6.1: "... or a prior tool result"). Called at every point
+        in this file that assigns into `state.results[...]` - a cache
+        hit, a freshly-run step, or an alias copying another step's
+        outcome - so a later step's `known_urls` kwarg always reflects
+        every URL surfaced by any step that has completed so far,
+        regardless of which of those three paths produced it."""
+        state.known_urls |= _extract_urls(str(value))
+
+    @staticmethod
     def _build_result(state: _TaskState, checklist: list[dict[str, Any]]) -> dict[str, Any]:
         completed = sum(1 for item in checklist if item["status"] == "completed")
         steps_summary = [
@@ -243,7 +283,9 @@ class Orchestrator:
             await session.commit()
         await self._publish_state(task)
 
-        self._active[task_id] = _TaskState(steps=steps, levels=levels)
+        self._active[task_id] = _TaskState(
+            steps=steps, levels=levels, known_urls=_extract_urls(intent_text)
+        )
         await self._advance(task_id)
         return task_id
 
@@ -305,7 +347,12 @@ class Orchestrator:
                 _logger.info("skill_execution_started", skill=skill.name, step=paused_index, task_id=task_id)
                 try:
                     with start_span("skill.execute", skill=skill.name, step=paused_index):
-                        output = await skill.run(**resolved_args)
+                        # `known_urls` (spec §6.1) is injected here, out
+                        # of band from `resolved_args` - never merged
+                        # into it, so it never perturbs `pending_args`
+                        # (already captured before the pause) or any
+                        # tool-result cache key computed from it.
+                        output = await skill.run(**resolved_args, known_urls=set(state.known_urls))
                 except Exception as exc:  # noqa: BLE001 - a skill's own failure, not swallowed (spec §12)
                     _logger.error(
                         "skill_execution_failed", skill=skill.name, step=paused_index,
@@ -321,6 +368,7 @@ class Orchestrator:
                 _logger.info("skill_execution_completed", skill=skill.name, step=paused_index, task_id=task_id)
 
                 state.results[paused_index] = output
+                self._merge_known_urls(state, output)
                 state.paused_index = None
                 self._mark_item(task, paused_index, status="completed")
                 await session.commit()
@@ -476,6 +524,7 @@ class Orchestrator:
                 if cached_result is not None:
                     _logger.info("tool_result_cache_hit", skill=skill.name, step=index, task_id=task.id)
                     state.results[index] = cached_result
+                    self._merge_known_urls(state, cached_result)
                     self._mark_item(task, index, status="completed")
                     continue
                 if cache_key in runner_for_key:
@@ -497,7 +546,10 @@ class Orchestrator:
             _logger.info("skill_execution_started", skill=skill.name, step=index, task_id=task.id)
             try:
                 with start_span("skill.execute", skill=skill.name, step=index):
-                    result = await skill.run(**args)
+                    # `known_urls` (spec §6.1) injected out of band here
+                    # too - see the identical note in
+                    # `resume_after_approval` above.
+                    result = await skill.run(**args, known_urls=set(state.known_urls))
             except Exception as exc:  # noqa: BLE001 - captured per-step, not swallowed (spec §12)
                 _logger.error(
                     "skill_execution_failed", skill=skill.name, step=index,
@@ -516,6 +568,7 @@ class Orchestrator:
                 any_failed = True
             else:
                 state.results[index] = output
+                self._merge_known_urls(state, output)
                 self._mark_item(task, index, status="completed")
                 cache_key = cache_keys.get(index)
                 if cache_key is not None:
@@ -526,6 +579,7 @@ class Orchestrator:
         for alias_index, runner_index in aliases.items():
             if runner_index in state.results:
                 state.results[alias_index] = state.results[runner_index]
+                self._merge_known_urls(state, state.results[alias_index])
                 self._mark_item(task, alias_index, status="completed")
             else:
                 reason = next(

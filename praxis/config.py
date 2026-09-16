@@ -84,6 +84,39 @@ class Settings(BaseSettings):
         default=None, description="Base URL of a Prometheus server for PrometheusConnector"
     )
 
+    # Phase 9 (web-fetch safety tools, spec §6.1, §7). Genuinely optional
+    # exactly like the three credentials above: unset means `WebConnector`
+    # is simply not auto-registered into the bootstrap registry (spec §7:
+    # "Enablement is a deployment-level toggle ... off by default, on by
+    # config" - the one connector class that reaches the open internet,
+    # unlike every other connector here which an operator already
+    # explicitly wired up by registering it at all). No live Tavily key
+    # is configured in this development environment - `WebConnector.search()`
+    # raises a clear `SearchProviderNotConfiguredError` rather than a
+    # silent empty-results no-op when this is unset (see
+    # `praxis.connectors.web.connector`).
+    tavily_api_key: str | None = Field(
+        default=None, description="Tavily search API key for TavilySearchProvider"
+    )
+
+    # The explicit, off-by-default deployment toggle for the web tools
+    # AS A GROUP (spec §7) - `web_search`/`web_read`/`web_crawl` self-
+    # register (`praxis.agents.skills.web_search`/`web_read`/`web_crawl`)
+    # only when this is set, regardless of whether `tavily_api_key` is
+    # also set (a `web_read`/`web_crawl`-only deployment needs no Tavily
+    # key at all, but still needs this switched on to make either tool
+    # visible to the Planner). Declared here for documentation/
+    # discoverability, but those three skill modules read the raw
+    # `PRAXIS_WEB_TOOLS_ENABLED` env var directly at import time rather
+    # than constructing a `Settings()` instance - constructing one would
+    # make importing a skill module fail on a missing `database_url`
+    # purely to decide whether to self-register, an unrelated hard
+    # dependency no other skill module has.
+    web_tools_enabled: bool = Field(
+        default=False,
+        description="Deployment-level toggle for web_search/web_read/web_crawl (off by default)",
+    )
+
     # Universal MCP connectors (spec §6): each entry becomes one
     # MCPConnector, registered by praxis.connectors.bootstrap.build_registry
     # directly (not via the self-registering-factory mechanism the four
