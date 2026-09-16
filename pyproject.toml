@@ -15,17 +15,24 @@ dependencies = [
     "structlog>=24.4",
     "typer>=0.13",
     "slack-sdk>=3.33",
-    "unstructured[pdf,docx]>=0.27,<0.28",
-    "pytesseract>=0.3.13,<0.4",
-    "pypdfium2>=5.0,<6.0",
-    "pandas>=2.2,<3.0",
-    "sentence-transformers>=3.3,<7.0",
-    "langchain-text-splitters>=0.3,<2.0",
-    "pillow>=10.4",
-    "openpyxl>=3.1,<4.0",
     "python-multipart>=0.0.9",
-    "mcp>=1.29",
+    # mcp 2.x renamed FastMCP -> MCPServer and changed other APIs;
+    # MCPConnector and its test fixtures are written against the 1.x
+    # API actually verified during development. Pin below 2.0 until a
+    # deliberate migration, rather than letting an unbounded >= pull a
+    # breaking major on the next fresh install.
+    "mcp>=1.29,<2.0",
 ]
+
+# Phase 3 (Ingestion & RAG) will need unstructured, pytesseract,
+# pypdfium2, pandas, sentence-transformers, langchain-text-splitters,
+# and pillow - deliberately not listed here yet. That draft attempt
+# pulled in a globally-broken torch DLL on this machine (unrelated to
+# Praxis's own code) that poisoned pytest's plugin autoload for every
+# test in the repo, not just the ones that need it. Re-add these when
+# Phase 3 is actually rebuilt, inside the isolated venv (see README /
+# .venv), so a fresh torch install there is never contaminated by
+# whatever else is on this machine's global Python.
 
 [project.optional-dependencies]
 dev = [
@@ -35,8 +42,14 @@ dev = [
     "respx>=0.20",
     # slack_sdk's AsyncWebClient talks aiohttp, not httpx (respx can't
     # intercept it) - aioresponses mocks aiohttp the same way respx
-    # mocks httpx, used only for SlackConnector's tests.
+    # mocks httpx, used only for SlackConnector's tests. aioresponses
+    # 0.7.9 (latest as of writing) hasn't kept up with aiohttp's
+    # ClientResponse internals past 3.10.x despite its own loose
+    # aiohttp<4.0 constraint - pin aiohttp down to a version actually
+    # compatible with the aioresponses version pip resolves, verified
+    # against this pairing, not assumed.
     "aioresponses>=0.7",
+    "aiohttp<3.11",
     # Async SQLite driver for SQLAlchemy's async engine - lets
     # SQLConnector's tests prove dialect-agnosticism against a real,
     # genuinely different dialect than Postgres, with zero external
