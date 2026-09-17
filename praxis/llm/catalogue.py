@@ -36,12 +36,17 @@ from praxis.cache.memory_cache import InMemoryCache
 from praxis.core.interfaces import Cache
 
 # Verified-available Claude model ids as of this phase. Do not invent
-# other model name strings - these are the only three in use.
+# other model name strings - these are the only ones in use.
 DEFAULT_MODEL_MAPPING: dict[str, str] = {
     "routing": "claude-haiku-4-5-20251001",
     "planning": "claude-sonnet-5",
     "code_synthesis": "claude-sonnet-5",
     "vision": "claude-sonnet-5",
+    # Phase 11 (spec §16.1's "Diagnosis subagent" step): a real
+    # reasoning task over a real fetched metric, warranting the same
+    # strong-tier model as planning/code_synthesis, not the cheap
+    # routing tier.
+    "diagnosis": "claude-sonnet-5",
 }
 
 # No expiry-by-default is deliberately too aggressive for an LLM whose

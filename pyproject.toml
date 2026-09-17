@@ -122,6 +122,12 @@ dev = [
     # genuinely different dialect than Postgres, with zero external
     # service required.
     "aiosqlite>=0.20",
+    # A genuine full-suite hang was observed (Phase 11 verification) with
+    # no traceback until manually killed - pytest has no built-in per-test
+    # deadline. This turns an indefinite hang into a clear, attributable
+    # failure instead of a silent block; see [tool.pytest.ini_options]'s
+    # `timeout` setting below for the actual bound.
+    "pytest-timeout>=2.4,<3.0",
 ]
 
 [project.scripts]
@@ -134,3 +140,12 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Global per-test deadline (pytest-timeout) - generous for a real Docker
+# sandbox run or a real LLM call, tight enough that a genuine hang (the
+# Phase 11 verification run that motivated this) fails clearly within two
+# minutes instead of blocking indefinitely. The two E2E walkthroughs poll
+# real external state for up to 300s by their own design (see their
+# `_POLL_TIMEOUT_SECONDS`) and are marked `@pytest.mark.timeout(350)`
+# individually to accommodate that, rather than raising this global
+# default for every other test.
+timeout = 90

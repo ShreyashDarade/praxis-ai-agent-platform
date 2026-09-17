@@ -219,6 +219,84 @@ def _slugify(name: str) -> str:
     return slug
 
 
+# Phase 11 (spec §16.2's dashboard walkthrough, adapted per that phase's
+# scope decision): matches a SQLAlchemy SQLite DSN in either shape
+# (`sqlite:///path` or `sqlite+aiosqlite:///path`) - the one SQL dialect
+# whose driver (`sqlite3`) is part of the Python standard library, and
+# therefore the one dialect a *synthesized* skill can actually be
+# sandbox-validated against for real (see `_connector_access_hint`
+# below).
+_SQLITE_DSN_RE = re.compile(r"^sqlite(?:\+\w+)?:///(?P<path>.+)$")
+
+
+def _sqlite_path_from_dsn(dsn: str) -> str | None:
+    """Extracts the raw filesystem path from a SQLite DSN, or `None` if
+    `dsn` isn't one - see `_connector_access_hint`."""
+    match = _SQLITE_DSN_RE.match(dsn)
+    return match.group("path") if match else None
+
+
+def _connector_access_hint(connector: Connector) -> str | None:
+    """A hint appended to the synthesis prompt telling the model exactly
+    how its generated code can reach `connector`'s real underlying data
+    using *only* the Python standard library.
+
+    Why this exists (see this module's own docstring for the sandbox's
+    "stdlib only, no network" constraint): the introspected
+    `connector_schema` alone tells the model *what shape* the data is,
+    but says nothing about *how to actually reach it* from inside a
+    network-isolated sandbox with no third-party packages installed -
+    a real, structural gap for any capability that needs to genuinely
+    query an external database, not just describe one. This is
+    currently only resolvable for a `SQLConnector` backed by a local
+    SQLite file (the one SQL dialect with a Python-stdlib driver,
+    `sqlite3`) - returns `None` for every other connector (a real,
+    honest limit, not a guess papered over: the model is left with only
+    the schema for those, exactly as before this phase).
+    """
+    dsn = getattr(connector, "dsn", None)
+    if not isinstance(dsn, str):
+        return None
+    sqlite_path = _sqlite_path_from_dsn(dsn)
+    if sqlite_path is None:
+        return None
+    return (
+        "This connector's underlying data is a local SQLite database file, "
+        "reachable directly with Python's standard library `sqlite3` module "
+        f"(no third-party driver, no network required) at the literal path "
+        f"{sqlite_path!r}. Hardcode this exact literal path as a plain "
+        "internal constant inside your generated module (e.g. a "
+        "module-level `_DB_PATH = " + repr(str(sqlite_path)) + "`) and connect "
+        "to it directly with `sqlite3.connect(_DB_PATH)` inside `run()`. "
+        "DEFAULT RULE: do NOT declare a connection/path/database-location "
+        "keyword argument in `inputs` or accept one as a `run(**kwargs)` "
+        "parameter at all, UNLESS the capability description above "
+        "explicitly asks you to accept the database path itself as a "
+        "named, caller-supplied argument (e.g. it explicitly names a "
+        "keyword argument for the path, such as saying the path is given "
+        "via keyword argument `db_path`) - only in that explicit case "
+        "should you declare such a parameter, and even then default it to "
+        "this literal path so the skill still works when the caller omits "
+        "it. Why the default rule matters: a real failure was traced "
+        "exactly to this - when a skill declares a connection/path "
+        "parameter that the capability description never actually asked "
+        "for, Praxis's Planner (which fills in every declared input from "
+        "the user's own casual wording) supplies a nonsense literal value "
+        "for it (e.g. the string \"this Postgres DB\", lifted straight "
+        "from a sentence like \"connect to this Postgres DB\"), silently "
+        "overriding the correct hardcoded path with a bogus one, and the "
+        "skill then fails trying to open a database file that doesn't "
+        "exist. So: only declare `inputs` for values that genuinely vary "
+        "per call (e.g. the query itself, a table name, a date range) or "
+        "that the description explicitly asked to be parameterized - "
+        "never silently add a path/connection parameter of your own "
+        "accord. Connect with `sqlite3.connect(...)` directly - do not "
+        "use SQLAlchemy, asyncpg, or any other third-party database "
+        "library, since only the Python standard library is importable "
+        "inside the validation sandbox."
+    )
+
+
 class CapabilityFactory:
     """Synthesizes, sandbox-validates, and registers new `Skill`s (spec §3/§7)."""
 
@@ -258,8 +336,10 @@ class CapabilityFactory:
                 connector=connector.name if connector else None,
             )
             connector_schema: dict[str, Any] | None = None
+            connector_access_hint: str | None = None
             if connector is not None:
                 connector_schema = await self._connector_schema(connector)
+                connector_access_hint = _connector_access_hint(connector)
             connector_schema_text = (
                 json.dumps(connector_schema, indent=2, default=str) if connector_schema is not None else None
             )
@@ -280,6 +360,7 @@ class CapabilityFactory:
                     _PROMPT_VERSION,
                     need_description=need_description,
                     connector_schema=connector_schema_text,
+                    connector_access_hint=connector_access_hint,
                     previous_code=previous_code,
                     previous_self_test=previous_self_test,
                     error_detail=error_detail,
@@ -342,14 +423,45 @@ class CapabilityFactory:
     # returning.
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _connector_identity(connector: Connector) -> str:
+        """`connector.name` alone is the right cache/lineage key for a
+        connector whose underlying data source is stable for the
+        connector's whole life (Prometheus, GitHub, Slack, MCP servers -
+        one name, one real endpoint, forever). It is the WRONG key for a
+        connector like the dashboard demo's "customer-db"
+        (`SQLConnector`), which is deliberately re-registered under the
+        *same* name against a *different* DSN every test run / every
+        redeploy (a fresh tmp_path SQLite file each time). Keying purely
+        by name meant a schema cached (or a GraphStore `describes` edge
+        written) for one run's SQLite file got silently reused by a
+        later run's differently-seeded file of the same connector name -
+        traced directly to a real, intermittent full-suite failure (the
+        dashboard walkthrough passing every time in isolation, failing
+        only when it ran after an earlier suite member had already
+        cached a "customer-db" schema). Folding in a DSN digest (when the
+        connector exposes one - `SQLConnector`/`PostgresConnector`'s own
+        `.dsn` property) makes the identity - and therefore the cache
+        key and the GraphStore lineage node - change whenever the actual
+        data source does, while connectors with no such notion of a
+        changeable backing DSN keep exactly their previous, simpler
+        name-only identity.
+        """
+        dsn = getattr(connector, "dsn", None)
+        if isinstance(dsn, str) and dsn:
+            dsn_digest = hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:12]
+            return f"{connector.name}:{dsn_digest}"
+        return connector.name
+
     async def _connector_schema(self, connector: Connector) -> dict[str, Any]:
-        cache_key = f"connector_schema:{connector.name}"
+        identity = self._connector_identity(connector)
+        cache_key = f"connector_schema:{identity}"
 
         cached = await self._schema_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        graph_hit = await self._graph_store.neighbors(connector.name, relation=_DESCRIBES_RELATION)
+        graph_hit = await self._graph_store.neighbors(identity, relation=_DESCRIBES_RELATION)
         if graph_hit:
             schema = graph_hit[0]["metadata"]["schema"]
             await self._schema_cache.set(cache_key, schema, ttl_seconds=self._schema_cache_ttl_seconds)
@@ -363,7 +475,7 @@ class CapabilityFactory:
             json.dumps(description.schema, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:16]
         await self._graph_store.add_edge(
-            source=connector.name,
+            source=identity,
             relation=_DESCRIBES_RELATION,
             target=f"schema:{digest}",
             metadata={"kind": description.kind, "schema": description.schema},

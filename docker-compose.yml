@@ -17,5 +17,32 @@ services:
       timeout: 5s
       retries: 10
 
+  # Phase 11 (spec §16.1's SRE walkthrough, adapted per that phase's
+  # scope decision): a real Prometheus + Pushgateway pair, standing in
+  # for the full production monitoring stack §16.1 narrates - real
+  # containers, real scrape/query behavior, nothing simulated. The demo
+  # seed script (praxis/demo/seed_prometheus_metric.py) pushes a
+  # synthetic incident metric to the Pushgateway; Prometheus scrapes it
+  # on its own real schedule (docker/prometheus.yml) and is then
+  # genuinely queryable through PrometheusConnector, exactly like a real
+  # deployment's Prometheus would be.
+  pushgateway:
+    image: prom/pushgateway:v1.9.0
+    restart: unless-stopped
+    ports:
+      - "9091:9091"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    depends_on:
+      - pushgateway
+
 volumes:
   praxis_db_data:

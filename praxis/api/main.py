@@ -21,6 +21,7 @@ from praxis.agents.scheduler import Scheduler
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
 from praxis.connectors.registry import ConnectorRegistry
+from praxis.connectors.sql.connector import SQLConnector
 from praxis.core.events import task_event_bus, task_state_snapshot
 from praxis.core.exceptions import ApprovalTimeoutError
 from praxis.core.interfaces import HealthStatus
@@ -102,7 +103,21 @@ def _build_connector_registry() -> ConnectorRegistry:
         settings = Settings()
     except Exception:  # noqa: BLE001
         return ConnectorRegistry()
-    return build_registry(settings)
+    registry = build_registry(settings)
+
+    # Phase 11 (spec §16.2's "customer-db"): a narrow, explicitly
+    # demo-labeled exception to `SQLConnector`'s own "no global DSN"
+    # design principle (see its docstring) - registers the one demo
+    # connector this phase's dashboard walkthrough needs, by the exact
+    # name (`"customer-db"`) spec §16.2's own example `/intent` payload
+    # names, only when this one demo-only setting is actually
+    # configured; skipped (not failed) otherwise, exactly like every
+    # other optional connector above.
+    if settings.demo_customer_db_dsn:
+        registry.register(
+            SQLConnector(dsn=settings.demo_customer_db_dsn, name="customer-db", read_only=True)
+        )
+    return registry
 
 
 # Connector *membership* is fixed at process startup (deployment config,
@@ -110,7 +125,15 @@ def _build_connector_registry() -> ConnectorRegistry:
 # Settings() per request because DB reachability is a live condition.
 # Each connector's own health() is still re-evaluated on every /health
 # call, via the closures all_health_checks() returns.
-for _connector_health_check in _build_connector_registry().all_health_checks():
+#
+# Phase 11: retained as a proper module-level singleton (not discarded
+# after registering health checks, as before this phase) - `_get_orchestrator`
+# below hands this exact registry to the Orchestrator so `connector_name`
+# resolution (spec §16.2) reaches the very same connectors `/health`
+# already reports on, never a second, independently-built registry.
+_connector_registry: ConnectorRegistry = _build_connector_registry()
+
+for _connector_health_check in _connector_registry.all_health_checks():
     register_health_check(_connector_health_check)
 
 
@@ -420,12 +443,29 @@ def _get_orchestrator() -> Orchestrator:
         store = PostgresStore(settings)
         planner = Planner(LLMCatalogue(), PromptManager())
         capability_factory = _build_capability_factory(settings, store)
-        _orchestrator = Orchestrator(store, planner, skill_registry, capability_factory)
+        # Phase 11 (spec §16.1 step 8's "the lineage graph records every
+        # skill/tool used") - constructed unconditionally, unlike
+        # `capability_factory` above, since lineage recording has no
+        # Docker dependency to degrade around.
+        graph_store = PgGraphStore(store)
+        _orchestrator = Orchestrator(
+            store,
+            planner,
+            skill_registry,
+            capability_factory,
+            connector_registry=_connector_registry,
+            graph_store=graph_store,
+        )
     return _orchestrator
 
 
 class IntentRequest(BaseModel):
     text: str
+    # Phase 11 (spec §16.2's literal example payload: `{"text": "...",
+    # "connector": "customer-db"}`) - optional, forwarded verbatim to
+    # `Orchestrator.start_task`'s own `connector_name` (see its
+    # docstring for resolution/failure semantics).
+    connector: str | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -440,7 +480,7 @@ class ClarifyRequest(BaseModel):
 async def create_intent(body: IntentRequest) -> dict[str, Any]:
     """Ad-hoc ask -> a new `Task`, run through the Orchestrator (spec §14)."""
     orchestrator = _get_orchestrator()
-    task_id = await orchestrator.start_task(body.text)
+    task_id = await orchestrator.start_task(body.text, connector_name=body.connector)
     return {"task_id": task_id}
 
 

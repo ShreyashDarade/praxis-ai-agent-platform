@@ -11,7 +11,7 @@ on top without needing to change this contract.
 `inputs`/`outputs` are deliberately loose (`dict[str, str]`, param name
 -> a short human-readable type/description string) rather than a full
 JSON-schema - their only consumer this phase is the Planner's prompt
-(`praxis/llm/prompts/plan_intent/v1.jinja2`), which needs enough for the
+(`praxis/llm/prompts/plan_intent/v2.jinja2`), which needs enough for the
 LLM to understand what each skill needs/returns, not a validating
 schema engine.
 

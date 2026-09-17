@@ -17,16 +17,25 @@ real detail, never silently. When no `CapabilityFactory` is supplied
 deployment without Docker reachable), the old behavior holds exactly:
 an unregistered skill fails the task immediately, with a clear message.
 
-**An honest gap, not a heuristic (see the phase report)**: synthesis
-triggered from here is never given a `connector` - the Planner (§7)
-doesn't currently produce any signal for "this step is about connector
-X," so there is no principled way for the Orchestrator to guess one
-without inventing a fake heuristic. `CapabilityFactory.synthesize`
-still fully supports connector-aware synthesis (schema introspection +
-caching, lineage edges) for a caller that *does* know the connector -
-see `praxis.agents.capability_factory`'s own tests - this is specifically
-about what the Orchestrator itself can determine from a bare
-`PlanStep`, which today is nothing.
+**Connector-aware synthesis (Phase 11, spec §16.2)**: `start_task` now
+takes an optional `connector_name` - when a caller (e.g. `POST /intent`'s
+`connector` field) names one, it's resolved through the
+`ConnectorRegistry` this Orchestrator was constructed with, *once*, up
+front, and the resolved `Connector` object is threaded through this
+task's whole run so that if/when a plan step needs synthesis,
+`capability_factory.synthesize(connector=...)` gets the real object -
+real schema introspection, real lineage edges, exactly like
+`praxis.agents.capability_factory`'s own connector-aware tests already
+exercise, just reached from here instead of only from a caller that
+constructs the Factory directly. An unknown `connector_name` is a
+clear, typed failure (the task fails with the real detail), never a
+silent ignore - this Orchestrator has no way to tell "the caller made a
+typo" apart from "proceed without one" otherwise. A bare `PlanStep`
+still carries no *per-step* connector signal (the Planner decomposes
+intents in general, not just connector-shaped ones) - one connector per
+task, resolved once, is the real, principled scope this phase's
+walkthrough actually needs, not a heuristic guess at a finer grain
+nothing in this codebase asks for yet.
 
 **Short-term vs. long-term state (spec §9)**: the execution graph's
 live state (`_TaskState` - resolved levels, in-flight args, partial
@@ -69,6 +78,7 @@ from praxis.cache.memory_cache import InMemoryCache
 from praxis.core.events import TaskEventBus, task_event_bus, task_state_snapshot
 from praxis.core.execution_graph import PlanStep, compute_levels, resolve_args
 from praxis.core.exceptions import SandboxViolationError, SynthesisValidationError
+from praxis.core.interfaces import Connector, GraphStore
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
 from praxis.memory.db import PostgresStore
 from praxis.memory.models import Task
@@ -120,6 +130,16 @@ class CapabilityFactoryLike(Protocol):
     ) -> Skill: ...
 
 
+class ConnectorRegistryLike(Protocol):
+    """What the Orchestrator needs from a connector registry (Phase 11,
+    spec §16.2) - satisfied by the real
+    `praxis.connectors.registry.ConnectorRegistry`, or any stand-in
+    exposing this one method in a test (mirrors `SkillRegistryLike`/
+    `CapabilityFactoryLike` above)."""
+
+    def get(self, name: str) -> Connector: ...
+
+
 @dataclass
 class _TaskState:
     """In-memory execution-graph state for one in-flight task (see module docstring).
@@ -149,6 +169,41 @@ class _TaskState:
     # "may only fetch a URL that already appears in validated task
     # input or a prior tool result."
     known_urls: set[str] = field(default_factory=set)
+    # Phase 11 (spec §16.2): the real `Connector` this task's
+    # `connector_name` (if any) resolved to at `start_task` time - `None`
+    # for the (still overwhelmingly common) case where a task names no
+    # connector at all. Threaded into `capability_factory.synthesize()`
+    # by `_synthesize_missing_skill` below whenever this task's plan
+    # needs a fresh capability synthesized.
+    connector: Connector | None = None
+
+
+def _expected_output_keys(all_steps: list[PlanStep], step_index: int) -> set[str]:
+    """Scans every step's args for a `"$<step_index>.<key>"` reference -
+    i.e. what output key(s) a later step in this same plan already
+    expects `step_index`'s (about-to-be-synthesized) skill to return.
+
+    Closes a real gap that would otherwise exist purely because the
+    Planner (which invents this key name, when it names a step whose
+    skill doesn't exist yet - spec §7/Phase 11's `plan_intent@v2`) and
+    the Capability Factory (which is what actually decides the
+    synthesized skill's real declared `outputs`) are two independent LLM
+    calls with no shared state between them - without this, a
+    downstream step could reference an output key the synthesized skill
+    never actually declared, and `resolve_args` would raise a `KeyError`
+    at run time for reasons neither LLM call could see coming. Feeding
+    the real, already-committed key name(s) back into the synthesis
+    `need_description` (see `_synthesize_missing_skill`) means the
+    Factory's LLM call knows exactly what shape is already expected of
+    it.
+    """
+    keys: set[str] = set()
+    prefix = f"${step_index}."
+    for other in all_steps:
+        for value in other.args.values():
+            if isinstance(value, str) and value.startswith(prefix):
+                keys.add(value[len(prefix):])
+    return keys
 
 
 def _describe_step(step: PlanStep) -> str:
@@ -171,6 +226,8 @@ class Orchestrator:
         skills: SkillRegistryLike,
         capability_factory: CapabilityFactoryLike | None = None,
         event_bus: TaskEventBus | None = None,
+        connector_registry: ConnectorRegistryLike | None = None,
+        graph_store: GraphStore | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
@@ -184,7 +241,29 @@ class Orchestrator:
         # published nowhere in particular unless something subscribes.
         # A test wanting an isolated bus can still pass its own.
         self._event_bus = event_bus if event_bus is not None else task_event_bus
+        # Phase 11 (spec §16.2): additive, defaults to `None` exactly
+        # like `capability_factory` above - every pre-Phase-11 caller
+        # (every test in this file that doesn't pass one) gets byte-for-
+        # byte the old behavior: a task naming no `connector_name` never
+        # touches this at all, and a task that does with no registry
+        # configured fails clearly (see `start_task`) rather than
+        # silently proceeding as if no connector had been named.
+        self._connector_registry = connector_registry
+        # Phase 11 (spec §16.1 step 8's "the lineage graph records every
+        # skill/tool used" - a general property of every task, not
+        # something reserved for freshly-synthesized skills, which is
+        # all Phase 6's `CapabilityFactory._register()` records on its
+        # own). Additive and optional, same posture as every dependency
+        # above: `None` (the default) means lineage recording is simply
+        # skipped, byte-for-byte the pre-Phase-11 behavior for every
+        # test/caller that doesn't pass one.
+        self._graph_store = graph_store
         self._active: dict[str, _TaskState] = {}
+
+    async def _record_skill_used(self, task_id: str, skill_name: str) -> None:
+        if self._graph_store is None:
+            return
+        await self._graph_store.add_edge(source=task_id, relation="used_skill", target=skill_name)
 
     async def _publish_state(self, task: Task) -> None:
         """Publishes a live snapshot of `task` to any `WS /tasks/{id}/
@@ -246,7 +325,7 @@ class Orchestrator:
     # Public API
     # ------------------------------------------------------------------ #
 
-    async def start_task(self, intent_text: str) -> str:
+    async def start_task(self, intent_text: str, *, connector_name: str | None = None) -> str:
         async with self._store.session() as session:
             task = Task(intent_text=intent_text, status="planning", checklist=[])
             session.add(task)
@@ -255,10 +334,45 @@ class Orchestrator:
             correlation_id = task.correlation_id
 
         with bind_correlation_id(correlation_id):
-            _logger.info("task_started", task_id=task_id, intent_text=intent_text)
+            _logger.info(
+                "task_started", task_id=task_id, intent_text=intent_text, connector_name=connector_name
+            )
+
+        # Phase 11 (spec §16.2): resolved once, up front - before the
+        # (real, potentially expensive) Planner call - so a caller-typo'd
+        # or unconfigured connector name fails fast and clearly, exactly
+        # like a Planner failure below, rather than silently proceeding
+        # with no connector and only surfacing the mismatch much later,
+        # deep inside a confusing synthesis failure.
+        connector: Connector | None = None
+        if connector_name is not None:
+            if self._connector_registry is None:
+                message = (
+                    f"task requested connector '{connector_name}' but this Orchestrator has "
+                    "no connector registry configured"
+                )
+                with bind_correlation_id(correlation_id):
+                    _logger.error(
+                        "task_connector_resolution_failed", task_id=task_id,
+                        connector_name=connector_name, error=message,
+                    )
+                await self._fail_task(task_id, message, checklist=[])
+                return task_id
+            try:
+                connector = self._connector_registry.get(connector_name)
+            except KeyError as exc:
+                with bind_correlation_id(correlation_id):
+                    _logger.error(
+                        "task_connector_resolution_failed", task_id=task_id,
+                        connector_name=connector_name, error=str(exc),
+                    )
+                await self._fail_task(task_id, f"unknown connector '{connector_name}': {exc}", checklist=[])
+                return task_id
 
         try:
-            steps = await self._planner.plan(intent_text, self._skills.all_skills())
+            steps = await self._planner.plan(
+                intent_text, self._skills.all_skills(), connector=connector
+            )
         except Exception as exc:  # noqa: BLE001 - a planning failure must fail the task, not crash the caller
             with bind_correlation_id(correlation_id):
                 _logger.error("task_planning_failed", task_id=task_id, error=str(exc))
@@ -284,7 +398,7 @@ class Orchestrator:
         await self._publish_state(task)
 
         self._active[task_id] = _TaskState(
-            steps=steps, levels=levels, known_urls=_extract_urls(intent_text)
+            steps=steps, levels=levels, known_urls=_extract_urls(intent_text), connector=connector
         )
         await self._advance(task_id)
         return task_id
@@ -360,7 +474,18 @@ class Orchestrator:
                     )
                     self._mark_item(task, paused_index, status="failed", reason=str(exc))
                     task.status = "failed"
-                    task.result = {"error": f"step {paused_index} ('{step.skill_name}') failed: {exc}"}
+                    # Preserve whatever steps *did* complete before this
+                    # one failed (per _build_result, keyed off state.results
+                    # and the checklist's current per-item status) rather
+                    # than discarding them - a failed task's real, already-
+                    # gathered data (e.g. a fetched metric) stays visible
+                    # via task.result["steps"], matching this system's
+                    # "nothing silently vanishes" checklist philosophy
+                    # (spec §7) instead of collapsing to a bare error string.
+                    task.result = {
+                        **self._build_result(state, task.checklist),
+                        "error": f"step {paused_index} ('{step.skill_name}') failed: {exc}",
+                    }
                     await session.commit()
                     await self._publish_state(task)
                     del self._active[task_id]
@@ -371,6 +496,7 @@ class Orchestrator:
                 self._merge_known_urls(state, output)
                 state.paused_index = None
                 self._mark_item(task, paused_index, status="completed")
+                await self._record_skill_used(task_id, skill.name)
                 await session.commit()
                 await self._publish_state(task)
 
@@ -418,6 +544,7 @@ class Orchestrator:
         self,
         session: AsyncSession,
         task: Task,
+        state: _TaskState,
         index: int,
         step: PlanStep,
         resolved_args: dict[str, Any],
@@ -443,10 +570,24 @@ class Orchestrator:
             "Synthesize a skill that fulfills this need, accepting exactly those keyword "
             "argument names."
         )
+        # Phase 11: fold in whatever key(s) a later step in this same
+        # plan already committed to reading from this step's result -
+        # see `_expected_output_keys`'s own docstring for why this
+        # matters (the Planner and the Factory are two independent LLM
+        # calls with no shared state otherwise).
+        expected_keys = _expected_output_keys(state.steps, index)
+        if expected_keys:
+            plural = len(expected_keys) != 1
+            need_description += (
+                f"\n\nA later step in this same plan will read this skill's result using "
+                f"the key(s) {sorted(expected_keys)!r} (as \"$<this step's index>.<key>\") - "
+                f"your declared `outputs` MUST include exactly {'those keys' if plural else 'that key'}, "
+                f"and `run()` must return a dict containing {'them' if plural else 'it'}."
+            )
         _logger.info("capability_synthesis_triggered", skill=step.skill_name, step=index, task_id=task.id)
         try:
             return await self._capability_factory.synthesize(
-                need_description=need_description, task_id=task.id
+                need_description=need_description, connector=state.connector, task_id=task.id
             )
         except (SynthesisValidationError, SandboxViolationError) as exc:
             # Both are surfaced identically at the Orchestrator level
@@ -497,7 +638,9 @@ class Orchestrator:
             try:
                 skill = self._skills.get_skill(step.skill_name)
             except KeyError:
-                skill = await self._synthesize_missing_skill(session, task, index, step, resolved_args)
+                skill = await self._synthesize_missing_skill(
+                    session, task, state, index, step, resolved_args
+                )
                 if skill is None:
                     return "failed"
 
@@ -526,6 +669,7 @@ class Orchestrator:
                     state.results[index] = cached_result
                     self._merge_known_urls(state, cached_result)
                     self._mark_item(task, index, status="completed")
+                    await self._record_skill_used(task.id, skill.name)
                     continue
                 if cache_key in runner_for_key:
                     aliases[index] = runner_for_key[cache_key]
@@ -570,6 +714,7 @@ class Orchestrator:
                 state.results[index] = output
                 self._merge_known_urls(state, output)
                 self._mark_item(task, index, status="completed")
+                await self._record_skill_used(task.id, run_plan[index][0].name)
                 cache_key = cache_keys.get(index)
                 if cache_key is not None:
                     await state.tool_cache.set(cache_key, output)
@@ -581,6 +726,7 @@ class Orchestrator:
                 state.results[alias_index] = state.results[runner_index]
                 self._merge_known_urls(state, state.results[alias_index])
                 self._mark_item(task, alias_index, status="completed")
+                await self._record_skill_used(task.id, state.steps[alias_index].skill_name)
             else:
                 reason = next(
                     (str(exc) for index, _, exc in outcomes if index == runner_index and exc is not None),

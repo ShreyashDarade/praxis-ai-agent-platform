@@ -1,0 +1,14 @@
+# Phase 11 (spec §16.1's SRE walkthrough) - a minimal, real Prometheus
+# config: scrapes the real Pushgateway service on a short interval so a
+# demo-seeded metric (praxis/demo/seed_prometheus_metric.py) becomes
+# genuinely queryable through Prometheus's own HTTP API within a real,
+# bounded, few-second window - see that module's `wait_until_queryable`.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: pushgateway
+    honor_labels: true
+    static_configs:
+      - targets: ["pushgateway:9091"]

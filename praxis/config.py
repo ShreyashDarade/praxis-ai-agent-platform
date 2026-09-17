@@ -84,6 +84,31 @@ class Settings(BaseSettings):
         default=None, description="Base URL of a Prometheus server for PrometheusConnector"
     )
 
+    # Phase 11 (spec §16.2's "customer-db", §19's bootstrap philosophy).
+    # DEMO-ONLY, deliberately narrow exception to the "no global DSN for
+    # SQLConnector" principle documented on `praxis.connectors.sql.
+    # connector.SQLConnector` itself ("connect to any SQL database" has
+    # no single DSN to gate a factory on - registering one is left to
+    # whoever needs it). This one field exists purely so Phase 11's own
+    # seeded "customer-db" walkthrough (tests/e2e/
+    # test_dashboard_walkthrough.py) has a single, real, named connector
+    # `praxis.api.main` can register at startup - it is NOT a general
+    # pattern for "the" external SQL database Praxis talks to, and nothing
+    # else in this codebase should ever grow a second field like it.
+    # Deliberately a SQLite DSN in practice (see
+    # `praxis/demo/seed_customer_db.py`'s docstring for exactly why): any
+    # *synthesized* skill's sandbox self-test can only import the Python
+    # standard library, and stdlib has no Postgres driver but does have
+    # `sqlite3` - so this is the one backend a synthesized "query this
+    # DB" skill can actually be sandbox-validated against for real.
+    demo_customer_db_dsn: str | None = Field(
+        default=None,
+        description=(
+            "DEMO-ONLY: DSN for Phase 11's seeded 'customer-db' SQLConnector "
+            "(spec §16.2's dashboard walkthrough); not a general pattern"
+        ),
+    )
+
     # Phase 9 (web-fetch safety tools, spec §6.1, §7). Genuinely optional
     # exactly like the three credentials above: unset means `WebConnector`
     # is simply not auto-registered into the bootstrap registry (spec §7:

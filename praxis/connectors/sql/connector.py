@@ -14,10 +14,15 @@ generic ``inspect()`` rather than Postgres-specific
 ``information_schema`` queries, so introspection works identically
 regardless of dialect.
 
-Like `PostgresConnector`, there is no global `Settings` field for this:
-"connect to any SQL database" has no single DSN to gate a factory on,
-so instantiating one is left to whoever needs it (a task, a test), not
-auto-registered by `praxis.connectors.bootstrap`.
+Like `PostgresConnector`, there is no *general-purpose* global `Settings`
+field for this: "connect to any SQL database" has no single DSN to gate
+a factory on, so instantiating one is left to whoever needs it (a task,
+a test), not auto-registered by `praxis.connectors.bootstrap`. Phase 11
+adds exactly one narrow, explicitly demo-labeled exception to this -
+`Settings.demo_customer_db_dsn`, registered as `"customer-db"` by
+`praxis.api.main` (not by `praxis.connectors.bootstrap.build_registry`
+itself) purely for spec §16.2's dashboard walkthrough - see that
+setting's own docstring; it is not a template for a second one.
 """
 from __future__ import annotations
 
@@ -52,14 +57,44 @@ class SQLConnector(Connector):
         self.read_only = read_only
         self._dsn = dsn
 
+    @property
+    def dsn(self) -> str:
+        """The DSN this connector was constructed with, exposed read-only.
+
+        Lets a caller that already legitimately knows this connector's
+        identity - e.g. `CapabilityFactory`, deciding whether a
+        synthesized skill can reach this connector's real data using
+        only the Python standard library (spec §8/§19/§20's sandbox
+        constraint - see its own docstring) - inspect it without a
+        separate, parallel channel to the same config value.
+        """
+        return self._dsn
+
     async def describe(self) -> ConnectorDescription:
+        """`schema` is `{"dialect": <SQLAlchemy dialect name>, "tables": {...}}`.
+
+        The `dialect` key exists for a real reason found in this phase's
+        own testing, not speculatively: a synthesized skill's generated
+        SQL needs to know it's targeting e.g. `"sqlite"` rather than
+        `"postgresql"` (SQLite has no `date_trunc`, a Postgres-only
+        function - a real Capability Factory run against this connector
+        generated Postgres-flavored SQL and failed against a real SQLite
+        DB before this field existed). `CapabilityFactory` JSON-dumps
+        this whole dict into the synthesis prompt regardless of its
+        internal shape, so surfacing the dialect here is what lets the
+        model generate dialect-correct SQL without guessing from the
+        DSN string alone. Nested under `"tables"` rather than a sibling
+        of each table name, so a real table happening to be named
+        `"dialect"` can never collide with this key.
+        """
         engine = create_async_engine(self._dsn)
         try:
+            dialect_name = engine.dialect.name
             async with engine.connect() as conn:
-                schema = await conn.run_sync(_introspect)
+                tables = await conn.run_sync(_introspect)
         finally:
             await engine.dispose()
-        return ConnectorDescription(kind="sql", schema=schema)
+        return ConnectorDescription(kind="sql", schema={"dialect": dialect_name, "tables": tables})
 
     async def read(self, query: str, **params: Any) -> Any:
         if self.read_only and _MUTATING_QUERY.match(query):

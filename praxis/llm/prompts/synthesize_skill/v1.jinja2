@@ -4,8 +4,11 @@ Capability needed:
 {{ need_description }}
 
 {% if connector_schema %}
-A connector relevant to this capability has already been introspected. Its real schema is below - use it to understand what data/shape is actually available; do not invent tables/columns/fields that aren't shown here:
+A connector relevant to this capability has already been introspected. Its real schema is below - use it to understand what data/shape is actually available; do not invent tables/columns/fields that aren't shown here. If this schema includes a "dialect" field, that is the ONE authoritative source of truth for which SQL dialect to write - it always overrides any dialect implied by the capability description's own wording (e.g. the description may casually say "Postgres" out of habit even when the schema's real "dialect" is "sqlite"; write for the schema's actual dialect every time, never the description's phrasing). Concretely: SQLite has no `date_trunc`, `EXTRACT(... FROM ...)`, or `::type` casts - use `strftime()` for date truncation/formatting and `CAST(x AS type)` for casts when `dialect` is `"sqlite"`; only use Postgres-specific syntax when `dialect` is genuinely `"postgresql"`.
 {{ connector_schema }}
+{% endif %}
+{% if connector_access_hint %}
+{{ connector_access_hint }}
 {% endif %}
 {% if previous_code %}
 A previous attempt at this exact capability failed sandbox validation. Read the real error below carefully and produce a genuinely corrected version - do not just resubmit the same code, and do not repeat the same mistake.

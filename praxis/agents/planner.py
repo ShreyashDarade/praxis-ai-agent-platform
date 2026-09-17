@@ -4,11 +4,26 @@ list the Orchestrator turns into an execution graph (§8).
 
 Every LLM call goes through the `LLMCatalogue` by purpose (`"planning"`
 - never a hardcoded model name) and every prompt through the
-`PromptManager` by `name@version` (`plan_intent@v1`) - no inline prompt
+`PromptManager` by `name@version` (`plan_intent@v2`) - no inline prompt
 string, per spec §7.
 
+**v2 (Phase 11)**: v1's "never invent a skill name that isn't listed"
+rule made real, LLM-driven capability synthesis (spec §3's "NO MATCH ->
+synthesize", §16.2's dashboard walkthrough) structurally unreachable
+from a real Planner call - the Orchestrator only ever triggers synthesis
+when a `PlanStep` names an unregistered skill
+(`Orchestrator._synthesize_missing_skill`), but v1 explicitly forbade
+the model from ever doing that. Every synthesis-triggering test before
+this phase used a hand-rolled `_FakePlanner` specifically to route
+around this - it was a real, latent gap, invisible until Phase 11's
+end-to-end test actually drove a real Planner call against an intent
+with no fitting skill. v2 adds the explicit escape hatch: prefer an
+existing skill whenever one genuinely fits, but invent a new
+snake_case `skill_name` when none does, which is exactly the signal
+`_synthesize_missing_skill` already needed.
+
 The model is asked to answer with a bare JSON array (see
-`praxis/llm/prompts/plan_intent/v1.jinja2`), but real models routinely
+`praxis/llm/prompts/plan_intent/v2.jinja2`), but real models routinely
 wrap JSON in a ```json ... ``` fence anyway - `_strip_code_fence`
 tolerates that. `parse_plan_response` is a standalone, non-async
 helper deliberately kept separate from any real LLM call so tests can
@@ -24,11 +39,12 @@ from typing import Any
 
 from praxis.agents.skill import Skill
 from praxis.core.execution_graph import PlanStep
+from praxis.core.interfaces import Connector
 from praxis.llm.catalogue import LLMCatalogue
 from praxis.llm.prompt_manager import PromptManager
 
 _PLAN_PROMPT_NAME = "plan_intent"
-_PLAN_PROMPT_VERSION = "v1"
+_PLAN_PROMPT_VERSION = "v2"
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
 
@@ -90,7 +106,13 @@ class Planner:
         self._catalogue = catalogue
         self._prompt_manager = prompt_manager
 
-    async def plan(self, intent_text: str, available_skills: list[Skill]) -> list[PlanStep]:
+    async def plan(
+        self,
+        intent_text: str,
+        available_skills: list[Skill],
+        *,
+        connector: Connector | None = None,
+    ) -> list[PlanStep]:
         # inputs/outputs are formatted to a plain string here, in Python,
         # rather than with a nested {% for %} inside the template: Jinja's
         # `trim_blocks=True` (praxis.llm.prompt_manager.PromptManager's
@@ -101,10 +123,25 @@ class Planner:
         # silently merging it with the next line. Formatting in Python
         # sidesteps the whole class of bug rather than fighting Jinja
         # whitespace control block-tag-by-block-tag.
+        # Real connector schema (dialect included) resolved once, up
+        # front, exactly like the Capability Factory's own synthesis
+        # prompt already does (`capability_factory.synthesize`'s
+        # `connector_schema_text`) - without this, the Planner has no
+        # way to know a connector introduced to it in casual wording as
+        # "Postgres" is actually backed by SQLite (or vice versa), and
+        # writes dialect-specific SQL (e.g. `date_trunc`) purely from
+        # the intent text's own phrasing, which then fails for real
+        # against whatever the connector actually is.
+        connector_schema_text: str | None = None
+        if connector is not None:
+            description = await connector.describe()
+            connector_schema_text = json.dumps(description.schema, indent=2, default=str)
+
         prompt = self._prompt_manager.render(
             _PLAN_PROMPT_NAME,
             _PLAN_PROMPT_VERSION,
             intent_text=intent_text,
+            connector_schema=connector_schema_text,
             skills=[
                 {
                     "name": skill.name,
