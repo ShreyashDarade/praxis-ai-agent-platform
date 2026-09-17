@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -9,7 +10,7 @@ from typing import Any, Awaitable, Callable
 import structlog
 from docker.errors import DockerException
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -339,6 +340,39 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
         response["summary"] = attachment_id.summary
         response["topics"] = attachment_id.topics or []
     return response
+
+
+@app.get("/artifacts/{key:path}")
+async def get_artifact(key: str) -> Response:
+    """Fetches a stored artifact - a rendered chart from `create_chart`
+    (spec §13) today, and, going forward, whatever else lands in the
+    same blob store under its own key - as a real binary response with
+    the right `Content-Type`, rather than a client having to reach for
+    the blob store directly.
+
+    `key:path` (not a plain `{key}`) so a real artifact key - which is
+    itself a relative path with a slash in it, e.g.
+    `"charts/<uuid>.png"` - is matched whole, not truncated at the first
+    `/`.
+
+    `LocalBlobStore` already refuses a `..`-containing/absolute key at
+    the store layer (`ValueError`, see `praxis.memory.blob_store`) - this
+    route's only job is to turn that, and a genuinely missing key
+    (`FileNotFoundError`), into a clean `400`/`404` rather than letting
+    either propagate as an unhandled `500` (spec §12: "never a silent
+    no-op or a 500").
+    """
+    settings = Settings()
+    blob_store = LocalBlobStore(settings.blob_store_root)
+    try:
+        data = await blob_store.get(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid artifact key: {exc}") from exc
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"no artifact stored under key '{key}'") from None
+
+    mime_type = mimetypes.guess_type(key)[0] or "application/octet-stream"
+    return Response(content=data, media_type=mime_type)
 
 
 # Orchestrator wiring (spec §3, §14). Unlike `upload_attachment`'s

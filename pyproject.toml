@@ -64,6 +64,16 @@ dependencies = [
     "apscheduler>=3.10,<4.0",
     "opentelemetry-sdk>=1.27,<2.0",
     "opentelemetry-api>=1.27,<2.0",
+    # Phase 10 (Analytics & Visualization, spec §13). `plotly` backs
+    # `praxis/analytics/visualize.py`'s `PlotlyVisualizer` (the MVP
+    # `Visualizer` implementation); `kaleido` is what `Figure.to_image()`
+    # needs to actually rasterize a static PNG (it manages its own
+    # headless-Chromium render backend under the hood as of its 1.x
+    # line - no separate browser install needed). Each pinned to the
+    # version actually resolved and verified in this venv, same
+    # discipline as every pin above.
+    "plotly>=7.1,<8.0",
+    "kaleido>=1.4,<2.0",
 ]
 
 # Windows-only caveat, discovered and fixed while verifying this exact

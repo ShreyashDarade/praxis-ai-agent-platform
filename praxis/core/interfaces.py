@@ -117,3 +117,39 @@ class SandboxResult:
 class SandboxExecutor(abc.ABC):
     @abc.abstractmethod
     async def run(self, code: str, *, timeout_seconds: int = 30) -> SandboxResult: ...
+
+
+@dataclass
+class ChartArtifact:
+    """What `Visualizer.render()` returns: a rendered chart, ready to hand
+    straight to a `BlobStore` (spec §13) - `content` is the raw bytes of
+    the artifact (a PNG image or an HTML document), never something a
+    caller has to further encode/decode to persist or serve.
+    """
+
+    content: bytes
+    mime_type: str
+
+
+class Visualizer(abc.ABC):
+    """Tabular result + chart type + encoding -> a chart artifact (spec §13).
+
+    Deliberately synchronous, like `Chunker.chunk` - rendering a chart is
+    local, CPU/subprocess-bound work, not I/O against an external
+    service; a caller on an async call path (e.g. a `Skill.run()`) that
+    wants to avoid blocking its event loop can dispatch this through
+    `asyncio.to_thread` itself, exactly as `SentenceTransformerEmbedder`
+    does around its own blocking `model.encode()` call.
+
+    `chart_type` names the kind of chart (e.g. ``"bar"``, ``"line"``,
+    ``"scatter"``) - which concrete kinds a given backend actually
+    supports is that backend's own concern, not part of this contract.
+    `encoding` is a minimal, Vega-Lite-ish mapping of chart *roles* to
+    column names present in `data` (e.g. ``{"x": "week", "y": "revenue",
+    "color": "department"}``), not a full grammar-of-graphics.
+    """
+
+    @abc.abstractmethod
+    def render(
+        self, data: list[dict[str, Any]], chart_type: str, encoding: dict[str, str]
+    ) -> ChartArtifact: ...
