@@ -33,3 +33,26 @@ Thumbs.db
 # importable skills package so neither a running process nor a
 # restart can execute unapproved code; never committed.
 praxis/agents/_quarantine/
+
+# Untracked at the project owner's request (2026-09-18). These remain
+# on disk and are still run and maintained locally - `git rm --cached`
+# only drops them from the index, and their history is retained.
+#
+# Consequence worth knowing: a fresh clone gets `praxis/` without the
+# test suite, the honest-status matrices, or the dev tooling, so CI and
+# any reviewer working from the remote cannot verify a claim against
+# the tests that back it.
+docs/
+tests/
+scripts/
+
+# Build artifacts
+dist/
+build/
+*.whl
+.coverage
+htmlcov/
+
+# Local tool config and the product brief - never committed here.
+.claude/
+Prompt.txt

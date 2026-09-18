@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     # being lost.
     schedule_poll_interval_seconds: int = Field(default=60, ge=1)
 
+    # An extra directory of declarative SKILL.md procedures this
+    # deployment supplies - typically a mounted volume. Loaded
+    # after the ones that ship inside the package, so an operator
+    # can add capabilities without rebuilding an image.
+    procedures_dir: str | None = Field(
+        default=None,
+        description="Additional directory to scan for SKILL.md procedures",
+    )
+
     # Phase 12 (Multi-tenancy, identity, RBAC/ABAC - Prompt §8, §11).
     # Off by default so a single-operator deployment (and this repo's
     # own test suite) keeps working exactly as before: with auth

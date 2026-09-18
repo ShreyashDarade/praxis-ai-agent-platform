@@ -331,6 +331,14 @@ class SkillRecord(Base):
     execution_budget: Mapped[dict] = mapped_column(JSON, default=dict)
     test_cases: Mapped[list] = mapped_column(JSON, default=list)
     code_hash: Mapped[str] = mapped_column(String(64), default="")
+    # The capability's own source, stored inert.
+    #
+    # For a declarative procedure this is its SKILL.md, and it is the
+    # only copy - one submitted over the API has no file behind it. It
+    # is also what approval re-compiles from, so the published
+    # capability is built from exactly the bytes that were reviewed
+    # rather than from an object someone kept in memory.
+    definition: Mapped[str] = mapped_column(Text, default="")
     source_path: Mapped[str] = mapped_column(String(512), default="")
     approved_by_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

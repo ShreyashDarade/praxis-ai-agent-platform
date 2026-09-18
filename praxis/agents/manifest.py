@@ -122,6 +122,19 @@ class SkillManifest:
     execution_budget: dict[str, Any] = field(default_factory=dict)
     test_cases: list[Any] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
+    # The declarative procedure: an ordered list of existing tools to
+    # call, and how each one's inputs are wired.
+    #
+    # This is what makes "add a capability with configuration only"
+    # true rather than aspirational. A step names a tool that must
+    # already exist and already be approved, so a procedure can compose
+    # capability without introducing any new executable code - the
+    # brief's preferred path, ahead of generating Python.
+    #
+    # Shape mirrors `praxis.agents.toollink.ToolLink` exactly (`args`
+    # static, `from` wired from an earlier step's output) so compiling
+    # one into the other needs no translation table that could drift.
+    steps: list[dict[str, Any]] = field(default_factory=list)
     # The long-form procedure. Loaded with the file but only *used*
     # when the skill is actually selected - the progressive-disclosure
     # half of the prompt's requirement.
@@ -167,6 +180,7 @@ class SkillManifest:
             execution_budget=dict(data.get("execution_budget") or {}),
             test_cases=list(data.get("test_cases") or []),
             keywords=list(data.get("keywords") or []),
+            steps=[dict(step) for step in (data.get("steps") or [])],
             body=body,
             source_path=source_path,
         )
@@ -210,6 +224,7 @@ class SkillManifest:
             "version": self.version,
             "risk": self.risk,
             "keywords": self.keywords,
+            "steps": self.steps,
             "supported_connectors": self.supported_connectors,
         }
 

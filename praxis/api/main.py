@@ -27,7 +27,7 @@ from docker.errors import DockerException
 from fastapi import FastAPI
 from sqlalchemy import select
 
-from praxis.agents import skill_registry
+from praxis.agents import procedure_registry, skill_registry
 from praxis.agents.capability_factory import CapabilityFactory
 from praxis.agents.conversation import ConversationService
 from praxis.agents.planner import Planner
@@ -78,6 +78,16 @@ parser_registry.discover_parsers()
 # `register_skill(...)` call is how a new skill gets added, not an edit
 # here.
 skill_registry.discover_skills()
+
+# Declarative capabilities: every `skills/**/SKILL.md` that composes
+# already-registered tools becomes a runnable skill. Loaded AFTER the
+# Python skills above, deliberately - a procedure can only compose
+# tools that already exist, so the things it composes have to be
+# registered first. A malformed one is logged and skipped rather
+# than taking startup down.
+_loaded_procedures = procedure_registry.load_from_disk()
+if _loaded_procedures:
+    _logger.info("declarative_skills_loaded", skills=_loaded_procedures)
 
 # Same discovery pattern for specialist sub-agents (Phase 15): one new
 # file in `praxis/agents/specialists/` with a `register_agent(...)`
@@ -378,10 +388,21 @@ def _build_scheduler() -> Scheduler | None:
         settings.schedule_poll_interval_seconds,
         job_id="schedule_poll",
     )
-    scheduler.start()
     return scheduler
 
 
+# Built at import (so the jobs are inspectable) but deliberately NOT
+# started here - `_lifespan` starts it when the application actually
+# runs.
+#
+# Starting background work at import time was a real defect, not a
+# style preference: the schedule poller queries the database every
+# minute, and importing this module for any reason - a CLI command, a
+# test that only wanted the app object - silently began doing that.
+# Against a test database being created and dropped between cases, a
+# poller running in a worker thread produces failures that move around
+# and vanish when the same tests are run alone, which is the most
+# expensive kind of bug to chase.
 _scheduler = _build_scheduler()
 
 
@@ -486,6 +507,7 @@ from praxis.api.routes import (  # noqa: E402
     dashboards,
     health,
     schedules,
+    skills,
     tasks,
 )
 
@@ -496,6 +518,7 @@ app.include_router(admin.router)
 app.include_router(dashboards.router)
 app.include_router(schedules.router)
 app.include_router(conversations.router)
+app.include_router(skills.router)
 
 
 async def _bootstrap_default_tenant() -> None:
@@ -528,7 +551,15 @@ async def _bootstrap_default_tenant() -> None:
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Startup/shutdown hooks (the modern replacement for `on_event`)."""
     await _bootstrap_default_tenant()
-    yield
+    if _scheduler is not None:
+        # Started here rather than at import: background jobs belong to
+        # a running application, not to the act of importing a module.
+        _scheduler.start()
+    try:
+        yield
+    finally:
+        if _scheduler is not None:
+            _scheduler.shutdown()
 
 
 # Assigned after the fact rather than passed to `FastAPI(...)` above,
