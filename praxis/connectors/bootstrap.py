@@ -42,11 +42,21 @@ from __future__ import annotations
 import importlib
 import pkgutil
 
+import structlog
+
 import praxis.connectors as _connectors_pkg
 from praxis.config import Settings
 from praxis.connectors import factory
 from praxis.connectors.mcp.mcp_connector import MCPConnector
 from praxis.connectors.registry import ConnectorRegistry
+from praxis.connectors.resilience import (
+    ConnectorResilience,
+    RateLimit,
+    ResilientConnector,
+)
+from praxis.core.interfaces import Connector
+
+_logger = structlog.get_logger(__name__)
 
 _DISCOVERED = False
 
@@ -67,21 +77,80 @@ def _discover_connector_modules() -> None:
         connector_module = f"praxis.connectors.{module_info.name}.{module_info.name}_connector"
         try:
             importlib.import_module(connector_module)
-        except ModuleNotFoundError:
-            # Not every subpackage is a connector (e.g. this file's own
-            # package has no <name>_connector.py at its own level) - skip
-            # silently rather than treating "no connector module here" as
-            # an error.
+        except ModuleNotFoundError as exc:
+            missing = exc.name or ""
+            if missing == connector_module or missing.startswith(
+                f"praxis.connectors.{module_info.name}"
+            ):
+                # Not every subpackage is a connector (e.g. this file's
+                # own package has no <name>_connector.py at its own
+                # level) - skip silently rather than treating "no
+                # connector module here" as an error.
+                continue
+            # The connector module exists but one of its imports does
+            # not. For a connector backed by an optional extra (`s3`
+            # needs `aioboto3`) that is the expected state of a base
+            # install, so it must not crash discovery - but it is a
+            # different fact from "there is no connector here", and
+            # collapsing the two would also hide a genuine typo'd import
+            # inside a connector. Logged at INFO, and the connector is
+            # simply unavailable.
+            _logger.info(
+                "connector unavailable: optional dependency not installed",
+                connector=module_info.name,
+                missing_module=missing,
+            )
             continue
     _DISCOVERED = True
+
+
+def _resilience_for(settings: Settings) -> ConnectorResilience | None:
+    """The shared rate limiter + breaker set for one registry, or None.
+
+    One per registry rather than one global: two tenants' registries
+    must not share a breaker, or one tenant's outage would reject the
+    other's calls to a connector that is working fine for them.
+    """
+    if not settings.connector_circuit_breaker_enabled and (
+        settings.connector_rate_limit_per_second is None
+    ):
+        return None
+
+    rate_limit = (
+        RateLimit(max_calls=int(settings.connector_rate_limit_per_second), period_seconds=1.0)
+        if settings.connector_rate_limit_per_second
+        else None
+    )
+    return ConnectorResilience(
+        default_rate_limit=rate_limit,
+        # A threshold this high effectively disables opening while
+        # keeping the rate limiter, for a deployment that wants
+        # throttling without breaking.
+        failure_threshold=(
+            settings.connector_failure_threshold
+            if settings.connector_circuit_breaker_enabled
+            else 2**31
+        ),
+        reset_timeout_seconds=settings.connector_circuit_reset_seconds,
+    )
 
 
 def build_registry(settings: Settings) -> ConnectorRegistry:
     _discover_connector_modules()
     registry = ConnectorRegistry()
+    resilience = _resilience_for(settings)
+
+    def _register(connector: Connector) -> None:
+        # Wrapping happens here, once, rather than inside each
+        # connector: resilience is a property of *calling* a connector,
+        # so none of the thirteen has to know about it.
+        registry.register(
+            ResilientConnector(connector, resilience) if resilience is not None else connector
+        )
+
     for connector_factory in factory.all_factories():
         if connector_factory.is_configured(settings):
-            registry.register(connector_factory.build(settings))
+            _register(connector_factory.build(settings))
 
     # Second, separate pass: one MCPConnector per configured
     # `MCPServerConfig` entry. Genuinely data-driven - a for-loop over a
@@ -89,7 +158,7 @@ def build_registry(settings: Settings) -> ConnectorRegistry:
     # function again, same "no core code change" property the
     # self-registering factories above give the four Phase 2 connectors.
     for server in settings.mcp_servers:
-        registry.register(
+        _register(
             MCPConnector(
                 name=server.name,
                 command=server.command,

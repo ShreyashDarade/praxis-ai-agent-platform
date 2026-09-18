@@ -11,7 +11,7 @@ with a NULL tenant.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -35,7 +35,7 @@ DEFAULT_TENANT_SLUG = "default"
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _uuid() -> str:
@@ -215,7 +215,9 @@ class Task(Base):
     pending_input: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
 
 
 class LangGraphCheckpoint(Base):

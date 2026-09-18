@@ -35,7 +35,7 @@ than no numbers.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -82,7 +82,7 @@ class Budget:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "Budget | None":
+    def from_dict(cls, payload: dict[str, Any] | None) -> Budget | None:
         if not payload:
             return None
         return cls(
@@ -150,7 +150,7 @@ class BudgetTracker:
         self,
         budget: Budget | None = None,
         *,
-        parent: "BudgetTracker | None" = None,
+        parent: BudgetTracker | None = None,
         pricing: dict[str, tuple[float, float]] | None = None,
         clock: Any = time.monotonic,
     ) -> None:
@@ -267,7 +267,7 @@ class BudgetTracker:
         if self._parent is not None:
             self._parent.record_descendant()
 
-    def child(self, budget: Budget | None = None) -> "BudgetTracker":
+    def child(self, budget: Budget | None = None) -> BudgetTracker:
         """A tracker for delegated work, charging this one too.
 
         The child's own `budget` may be tighter than the parent's but

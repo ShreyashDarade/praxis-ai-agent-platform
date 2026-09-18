@@ -1,13 +1,25 @@
 # praxis/cache/memory_cache.py
-"""`InMemoryCache` (spec §11): the one `Cache` implementation for this
-MVP - "one `Cache` interface, in-process TTL/LRU for MVP" - backing all
+"""`InMemoryCache` (spec §11): the default `Cache` implementation -
+"one `Cache` interface, in-process TTL/LRU for MVP" - backing all
 four caching scopes spec §11 names (LLM response, embedding,
-connector/schema-introspection, tool-result). Each scope owns its own
+connector/schema-introspection, tool-result). It is no longer the only
+one: `praxis.cache.redis_cache.RedisCache` implements the same
+interface over a shared keyspace, for the deployments where "each
+worker warms its own copy" and "no way to invalidate what another
+process holds" stop being acceptable. Each scope owns its own
 instance (a fresh, task-scoped one for the tool-result scope; longer-
 lived, component-owned ones for the other three) - never one cache
 shared across unrelated scopes, so a policy tuned for one scope (e.g.
 the tool-result cache's "lives exactly as long as one task") never
 leaks into another.
+
+Those four are no longer the whole list: the product brief adds a
+semantic/query cache, a retrieval cache and a dashboard-result cache.
+Every scope's name, default TTL, invalidation rule, and whether it may
+ever be served from a *similarity* match now lives in
+`praxis.cache.scopes` - this docstring is deliberately not the place
+that list grows, because a constant a caller can import is enforceable
+and a prose list is not.
 """
 from __future__ import annotations
 
@@ -30,9 +42,15 @@ class InMemoryCache(Cache):
     Not thread-safe by design - single-process asyncio is this MVP's
     only concurrency model (spec: "Thread-safety isn't a concern").
     `get`/`set` are genuinely `async def` purely to satisfy the `Cache`
-    ABC's contract; a future backend (e.g. Redis) swapped in behind the
-    same interface is exactly where a real `await` would start to
-    matter.
+    ABC's contract; `RedisCache`, swapped in behind the same interface,
+    is where a real `await` starts to matter.
+
+    Stores the value object itself, by reference, with no serialization
+    at all - which is faster than `RedisCache` and also a real
+    behavioral difference callers should know about: a mutable value
+    handed to `set()` and then mutated by the caller changes what a
+    later `get()` returns, whereas a JSON round trip through Redis
+    would have frozen it.
     """
 
     def __init__(self) -> None:

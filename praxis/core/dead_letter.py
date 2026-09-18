@@ -23,7 +23,7 @@ auth error", and only the history distinguishes them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -64,7 +64,7 @@ class FailureRecord:
     attempt: int
     error: str
     error_type: str
-    occurred_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,7 +99,7 @@ class DeadLetterQueue:
         attempts on one entry rather than creating a new row each
         time, which is what makes the failure history readable.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         failure = FailureRecord(
             attempt=1, error=str(error), error_type=type(error).__name__
         )
@@ -163,7 +163,7 @@ class DeadLetterQueue:
 
     async def due_for_retry(self, *, tenant_id: str | None = None) -> list[DeadLetterEntry]:
         """Entries whose backoff has elapsed."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self._store.session() as session:
             stmt = select(DeadLetterEntry).where(
                 DeadLetterEntry.state == DeadLetterState.PENDING_RETRY.value,

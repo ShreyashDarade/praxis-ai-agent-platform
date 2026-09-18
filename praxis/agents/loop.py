@@ -57,10 +57,11 @@ from __future__ import annotations
 import hashlib
 import json
 import operator
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Annotated, Any, Awaitable, Callable, TypedDict
+from typing import Annotated, Any, TypedDict
 
 import structlog
 from langgraph.errors import GraphRecursionError
@@ -153,7 +154,7 @@ class Iteration:
     index: int
     action: Action
     observation: Observation
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict[str, Any]:
         return {

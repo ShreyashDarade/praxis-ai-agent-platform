@@ -18,18 +18,18 @@ can widen a permission, forge a principal, or approve an action:
   approval records (Prompt §8), re-verified when a paused task resumes.
 - `audit.py` - the append-only `AuditLog` writer.
 """
-from praxis.security.principal import (
-    Principal,
-    SYSTEM_PRINCIPAL,
-    system_principal_for_tenant,
-)
 from praxis.security.policy import (
     Permission,
+    PermissionDeniedError,
     PolicyDecision,
     PolicyEngine,
     Role,
-    PermissionDeniedError,
     TenantIsolationError,
+)
+from praxis.security.principal import (
+    SYSTEM_PRINCIPAL,
+    Principal,
+    system_principal_for_tenant,
 )
 
 __all__ = [

@@ -33,7 +33,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -131,7 +131,7 @@ class SkillManifest:
     synthesized: bool = False
 
     @classmethod
-    def from_markdown(cls, text: str, *, source_path: str = "") -> "SkillManifest":
+    def from_markdown(cls, text: str, *, source_path: str = "") -> SkillManifest:
         """Parses a SKILL.md document."""
         match = _FRONTMATTER_RE.match(text.lstrip("﻿"))
         if match is None:
@@ -172,14 +172,14 @@ class SkillManifest:
         )
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "SkillManifest":
+    def from_file(cls, path: str | Path) -> SkillManifest:
         file_path = Path(path)
         return cls.from_markdown(
             file_path.read_text(encoding="utf-8"), source_path=str(file_path)
         )
 
     @classmethod
-    def from_skill(cls, skill: Any, **overrides: Any) -> "SkillManifest":
+    def from_skill(cls, skill: Any, **overrides: Any) -> SkillManifest:
         """Derives a manifest from an already-imported `Skill`.
 
         The bridge for the hand-written skills that predate manifests:
@@ -243,4 +243,4 @@ def compute_code_hash(code: str) -> str:
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)

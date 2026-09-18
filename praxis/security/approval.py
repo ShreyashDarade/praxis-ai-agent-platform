@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -90,7 +90,7 @@ def compute_idempotency_key(task_id: str, step_index: int, action_hash: str) -> 
     different actions - so replaying an approve call is a no-op rather
     than a second authorization."""
     return hashlib.sha256(
-        f"{task_id}:{step_index}:{action_hash}".encode("utf-8")
+        f"{task_id}:{step_index}:{action_hash}".encode()
     ).hexdigest()[:64]
 
 
@@ -125,7 +125,7 @@ async def create_pending_approval(
         action=request.action,
         action_hash=action_hash,
         idempotency_key=idempotency_key,
-        expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+        expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
     )
     session.add(record)
     await session.flush()
@@ -172,8 +172,8 @@ async def decide_approval(
 
     expires_at = record.expires_at
     if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at <= datetime.now(timezone.utc):
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at <= datetime.now(UTC):
         raise ApprovalExpiredError(
             f"approval for task '{task_id}' step {step_index} expired at {expires_at.isoformat()}",
             expired_at=expires_at,
@@ -181,7 +181,7 @@ async def decide_approval(
 
     record.approved = approved
     record.approver_user_id = principal.user_id
-    record.decided_at = datetime.now(timezone.utc)
+    record.decided_at = datetime.now(UTC)
     await session.flush()
     return record
 

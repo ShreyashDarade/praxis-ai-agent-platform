@@ -22,8 +22,9 @@ convenience.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
-from typing import Any, Iterator, MutableMapping
+from typing import Any
 
 import structlog
 

@@ -19,14 +19,15 @@ spec §10 exactly.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
 
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
 from opentelemetry.trace import Span
+from opentelemetry.util.types import AttributeValue
 
 _CONFIGURED = False
 _SERVICE_NAME = "praxis"
@@ -70,7 +71,7 @@ def get_tracer() -> trace.Tracer:
 
 
 @contextmanager
-def start_span(name: str, **attributes: object) -> Iterator[Span]:
+def start_span(name: str, **attributes: AttributeValue) -> Iterator[Span]:
     """Starts a span named `name`, as a child of whichever span (if any)
     is currently active in this context - see the module docstring."""
     tracer = get_tracer()

@@ -52,7 +52,11 @@ from dataclasses import dataclass
 import httpx
 
 from praxis.connectors.web import ssrf
-from praxis.connectors.web.errors import ByteCapExceededError, DisallowedContentTypeError, TooManyRedirectsError
+from praxis.connectors.web.errors import (
+    ByteCapExceededError,
+    DisallowedContentTypeError,
+    TooManyRedirectsError,
+)
 
 DEFAULT_ALLOWED_CONTENT_TYPES: tuple[str, ...] = (
     "text/html",
@@ -143,7 +147,8 @@ async def fetch(
             parsed = httpx.URL(current_url)
             if parsed.scheme not in ("http", "https"):
                 raise ssrf.SSRFRejectedError(
-                    f"scheme '{parsed.scheme}' is not allowed for a guarded fetch (url: {current_url})",
+                    f"scheme '{parsed.scheme}' is not allowed for a guarded fetch "
+                    f"(url: {current_url})",
                     host=parsed.host or "",
                     reason="disallowed_scheme",
                 )
@@ -169,7 +174,10 @@ async def fetch(
 
             response = await client.send(request, stream=True)
             try:
-                if response.status_code in _REDIRECT_STATUS_CODES and "location" in response.headers:
+                if (
+                    response.status_code in _REDIRECT_STATUS_CODES
+                    and "location" in response.headers
+                ):
                     location = response.headers["location"]
                     hops += 1
                     if hops > max_hops:
@@ -189,7 +197,8 @@ async def fetch(
                 family = _content_type_family(content_type_header)
                 if family is None or family not in allowed_families:
                     raise DisallowedContentTypeError(
-                        f"content type '{content_type_header}' is not allowed fetching '{current_url}'",
+                        f"content type '{content_type_header}' is not allowed "
+                        f"fetching '{current_url}'",
                         content_type=content_type_header,
                         url=current_url,
                     )

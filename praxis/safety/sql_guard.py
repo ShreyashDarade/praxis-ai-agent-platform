@@ -258,7 +258,8 @@ class SqlGuard:
 
         if not kind.is_read_only:
             raise UnsafeQueryError(
-                f"only read queries are permitted here, but this is a {kind.value.upper()} statement",
+                "only read queries are permitted here, but this is a "
+                f"{kind.value.upper()} statement",
                 reason="not_readonly",
                 detail=kind.value,
             )

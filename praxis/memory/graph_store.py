@@ -41,17 +41,16 @@ class PgGraphStore(GraphStore):
         *,
         tenant_id: str = DEFAULT_TENANT_ID,
     ) -> None:
-        async with self._store.session() as session:
-            async with session.begin():
-                session.add(
-                    GraphEdge(
-                        tenant_id=tenant_id,
-                        source=source,
-                        relation=relation,
-                        target=target,
-                        edge_metadata=dict(metadata) if metadata is not None else {},
-                    )
+        async with self._store.session() as session, session.begin():
+            session.add(
+                GraphEdge(
+                    tenant_id=tenant_id,
+                    source=source,
+                    relation=relation,
+                    target=target,
+                    edge_metadata=dict(metadata) if metadata is not None else {},
                 )
+            )
 
     async def neighbors(
         self,

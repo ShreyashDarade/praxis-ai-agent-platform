@@ -25,6 +25,7 @@ change, exactly like every other external dependency in this codebase.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any
 
@@ -226,17 +227,13 @@ class DockerSandboxExecutor(SandboxExecutor):
                 # non-zero, non-hanging timeout outcome (spec §12: a
                 # timeout is never silently represented as success).
                 stdout = _try_logs(container, stdout=True, stderr=False)
-                try:
+                with contextlib.suppress(NotFound, DockerException):
                     container.kill()
-                except (NotFound, DockerException):
-                    pass
                 stderr = f"sandbox execution timed out after {timeout_seconds}s and was killed"
                 return SandboxResult(exit_code=124, stdout=stdout, stderr=stderr)
         finally:
-            try:
+            with contextlib.suppress(NotFound, DockerException):
                 container.remove(force=True)
-            except (NotFound, DockerException):
-                pass
 
 
 def _was_oom_killed(container: Any) -> bool:

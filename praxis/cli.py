@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any
 
 import typer
 from alembic import command as alembic_command
@@ -35,7 +36,7 @@ def main() -> None:
 @dataclass
 class InitStep:
     name: str
-    run: Callable[[Settings], Awaitable[str]]
+    run: Callable[[Settings], Coroutine[Any, Any, str]]
 
 
 async def _validate_config(settings: Settings) -> str:

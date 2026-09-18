@@ -38,8 +38,8 @@ from typing import Any
 from praxis.agents.skill import Skill, SkillConfigurationError
 from praxis.agents.skill_registry import register_skill
 from praxis.config import Settings
-from praxis.connectors.web.web_connector import WebConnector
 from praxis.connectors.web.search_provider import TavilySearchProvider
+from praxis.connectors.web.web_connector import WebConnector
 
 _DEFAULT_MAX_RESULTS = 5
 _WEB_TOOLS_ENABLED = os.environ.get("PRAXIS_WEB_TOOLS_ENABLED", "").strip().lower() in (
@@ -69,8 +69,12 @@ class WebSearchSkill(Skill):
                 "return an empty result set disguised as a real search"
             )
 
-        connector = WebConnector(search_provider=TavilySearchProvider(api_key=settings.tavily_api_key))
-        results = await connector.search(objective=objective, queries=queries, max_results=max_results)
+        connector = WebConnector(
+            search_provider=TavilySearchProvider(api_key=settings.tavily_api_key)
+        )
+        results = await connector.search(
+            objective=objective, queries=queries, max_results=max_results
+        )
         return {"results": results}
 
 

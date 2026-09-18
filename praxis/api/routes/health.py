@@ -9,13 +9,20 @@ from __future__ import annotations
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from praxis.api import main
-
 router = APIRouter()
 
 
 @router.get("/health")
 async def health() -> JSONResponse:
+    # Imported inside the handlers, not at module scope: `main` imports
+    # this module (to mount the router), so a module-level import here
+    # is a genuine cycle that resolves today only because of import
+    # ordering. Deferring it to call time removes the cycle without
+    # moving any shared state out of `main` - several tests reset
+    # `main._orchestrator` directly, and relocating it would make that
+    # reset silently stop working.
+    from praxis.api import main
+
     results = await main.run_health_checks()
 
     overall = all(r.healthy for r in results)

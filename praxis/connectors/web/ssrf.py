@@ -102,7 +102,9 @@ def resolve_and_validate(hostname: str) -> str:
         # No DNS query at all for a literal IP - nothing to resolve.
         if _is_disallowed_ip(literal):
             raise SSRFRejectedError(
-                f"IP address '{hostname}' is not allowed", host=hostname, reason="disallowed_ip_range"
+                f"IP address '{hostname}' is not allowed",
+                host=hostname,
+                reason="disallowed_ip_range",
             )
         return str(literal)
 
@@ -115,7 +117,7 @@ def resolve_and_validate(hostname: str) -> str:
             reason="dns_resolution_failed",
         ) from exc
 
-    resolved_ips = {info[4][0] for info in addrinfo}
+    resolved_ips = {str(info[4][0]) for info in addrinfo}
     if not resolved_ips:
         raise SSRFRejectedError(
             f"hostname '{hostname}' resolved to no addresses", host=hostname, reason="no_addresses"

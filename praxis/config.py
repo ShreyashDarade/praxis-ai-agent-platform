@@ -65,6 +65,76 @@ class Settings(BaseSettings):
     # operator deliberately sets them apart.
     approval_ttl_seconds: int = Field(default=3600, ge=1)
 
+    # Phase 21 (Prompt §7: "Generated agents/tools must never be
+    # silently trusted ... require approval before publishing/enabling
+    # it").
+    #
+    # Defaults to TRUE, unlike most toggles here, and the asymmetry is
+    # deliberate: every other optional feature defaults off because its
+    # absence is merely a missing capability, whereas this one
+    # defaults on because its absence is a missing *control*.
+    # "LLM-authored code runs unreviewed unless an operator remembered
+    # to switch review on" is precisely the posture the brief forbids,
+    # so the unsafe direction has to be the one someone opts into
+    # explicitly - and that choice is then visible in their config
+    # rather than implicit in ours.
+    #
+    # With this on, a synthesized skill is recorded as
+    # `pending_approval`: sandbox-validated, catalogued, and visible in
+    # the approval queue, but refused at execution until a principal
+    # holding `skill:approve` signs off on its exact code hash
+    # (`praxis.agents.publication`).
+    require_skill_approval: bool = Field(
+        default=True,
+        description="Require human approval before a synthesized skill may be executed",
+    )
+
+    # Whether a finished task keeps its LangGraph checkpoints.
+    #
+    # Defaults to retaining them, because `Orchestrator.replay_history`
+    # is the brief's "replay/debug mode" and the run an operator most
+    # wants to inspect is a *failed* one - deleting a task's history the
+    # moment it fails destroys exactly the evidence the feature exists
+    # to provide. The cost is honest and worth naming: checkpoint rows
+    # accumulate, roughly one per superstep per task, so a deployment
+    # running many short tasks should either set this False or prune on
+    # a schedule via `Orchestrator.prune_task_history`.
+    retain_checkpoints_after_completion: bool = Field(
+        default=True,
+        description="Keep a finished task's checkpoints so its run stays replayable",
+    )
+
+    # Per-connector resilience (brief §6's "rate limiting, retries,
+    # circuit breakers"). See `praxis.connectors.resilience`.
+    #
+    # The circuit breaker defaults ON because it costs nothing on the
+    # happy path - a closed circuit is one attribute check - and the
+    # failure it prevents (retrying into a known-dead dependency, N
+    # users turning one outage into 3N units of load) is real.
+    connector_circuit_breaker_enabled: bool = Field(
+        default=True,
+        description="Open a per-connector circuit after repeated failures",
+    )
+    connector_failure_threshold: int = Field(
+        default=5,
+        ge=1,
+        description="Consecutive failures before a connector's circuit opens",
+    )
+    connector_circuit_reset_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="How long an open circuit waits before admitting one trial call",
+    )
+    # Rate limiting defaults OFF: a limit nobody asked for is a latency
+    # bug waiting to be discovered in production, and the right value is
+    # a property of the *vendor's* quota, which only the deployment
+    # knows. Unset means unthrottled, which is the historical behaviour.
+    connector_rate_limit_per_second: float | None = Field(
+        default=None,
+        gt=0,
+        description="Optional per-connector call rate ceiling (calls per second)",
+    )
+
     # Phase 7 (Exception handling, spec §12): how long a task may sit
     # `awaiting_approval`/`awaiting_clarification` before
     # `praxis.api.main.sweep_stale_approvals` marks it `failed` with an
@@ -88,6 +158,45 @@ class Settings(BaseSettings):
         description="Local filesystem root directory for LocalBlobStore",
     )
 
+    # Distributed cache (brief §10). Unset means the deployment uses
+    # the in-process `InMemoryCache`, which is a supported
+    # configuration, not a degraded one - `praxis.cache.redis_cache.
+    # redis_cache_from_settings` returns None rather than raising, the
+    # same "unset = simply off" rule the connector credentials below
+    # follow. Setting it makes cache entries shared across workers and
+    # makes `RedisCache.invalidate_prefix` able to reach entries this
+    # process never wrote. Note that an unreachable Redis is NOT an
+    # error either: `RedisCache` degrades every operation to a miss
+    # (see its module docstring), so a cache outage costs the
+    # deployment its speedup and nothing else.
+    redis_url: str | None = Field(
+        default=None,
+        description="Redis URL (e.g. redis://localhost:6379/0) for the distributed Cache",
+    )
+    redis_namespace: str = Field(
+        default="praxis",
+        description="Key prefix isolating this deployment's entries in a shared Redis",
+    )
+
+    # S3-compatible object storage (spec §2's BlobStore swap path).
+    # Unset means `LocalBlobStore` under `blob_store_root`. No
+    # credential fields: botocore's standard chain (environment,
+    # shared config, instance/task role) is how a deployment avoids
+    # holding long-lived keys in application config at all, and adding
+    # fields here would invite exactly that. `s3_endpoint_url` is what
+    # points the same client at MinIO/R2/Ceph instead of AWS.
+    s3_bucket: str | None = Field(
+        default=None, description="Bucket name for S3BlobStore; unset means LocalBlobStore"
+    )
+    s3_endpoint_url: str | None = Field(
+        default=None, description="Override endpoint for an S3-compatible service (MinIO, R2, ...)"
+    )
+    s3_region: str | None = Field(default=None, description="AWS region for S3BlobStore")
+    s3_key_prefix: str = Field(
+        default="",
+        description="Bucket-relative prefix for every object; NOT a tenant boundary",
+    )
+
     # Optional connector credentials (spec §6, §19 step 4). Each is
     # genuinely optional: an unset value means that connector is simply
     # not registered (praxis.connectors.bootstrap.build_registry skips
@@ -104,6 +213,140 @@ class Settings(BaseSettings):
     )
     prometheus_url: str | None = Field(
         default=None, description="Base URL of a Prometheus server for PrometheusConnector"
+    )
+
+    # Six more optional data-source connectors, on exactly the same terms
+    # as the three above: every field here defaults to None, and an unset
+    # field means `praxis.connectors.bootstrap.build_registry` simply does
+    # not register that connector - never a validation error, never a
+    # connector registered in a half-configured state that only fails at
+    # query time. Each connector's own `is_configured` gate names the
+    # minimum subset that makes it usable at all (e.g. neo4j needs all
+    # three of uri/user/password; s3 needs both halves of the key pair),
+    # so "registered" always means "has enough config to attempt a call".
+    #
+    # The optional extras alongside each minimum (a default database,
+    # bucket, or auth header) are genuinely optional in a *different*
+    # sense: their absence does not block registration, but it does
+    # narrow what the connector can do, and each connector raises a
+    # `ConnectorConfigurationError` naming the missing setting rather
+    # than guessing - see `praxis.connectors.errors`.
+
+    mongodb_uri: str | None = Field(
+        default=None,
+        description="MongoDB connection URI (mongodb:// or mongodb+srv://) for MongoDBConnector",
+    )
+    # Optional because a MongoDB URI may already name a default database
+    # in its path (`mongodb://host:27017/analytics`). When it doesn't,
+    # this is the only way to say which database to describe and query -
+    # MongoDB has no "current database" the driver can infer.
+    mongodb_database: str | None = Field(
+        default=None,
+        description="Database name for MongoDBConnector; overrides any database in mongodb_uri",
+    )
+
+    elasticsearch_url: str | None = Field(
+        default=None,
+        description="Base URL of an Elasticsearch/OpenSearch cluster for ElasticsearchConnector",
+    )
+    # Elastic's own recommended machine credential. Basic auth is
+    # supported by the connector class (its `basic_auth` constructor
+    # argument) but deliberately has no Settings field: an operator
+    # wiring this up from config should be issuing a scoped API key, not
+    # putting a cluster superuser's password in the environment.
+    elasticsearch_api_key: str | None = Field(
+        default=None,
+        description="Base64 Elasticsearch API key (sent as 'Authorization: ApiKey ...')",
+    )
+
+    # S3-compatible object storage read as a DATA SOURCE (real AWS S3,
+    # MinIO, Ceph RGW, Cloudflare R2, Backblaze B2's S3 endpoint, ...).
+    #
+    # Prefixed `s3_connector_` rather than reusing the plain `s3_*`
+    # fields above, and the distinction is load-bearing, not cosmetic:
+    # those belong to `S3BlobStore`, where `s3_bucket` means *Praxis's
+    # own artifact bucket* - somewhere Praxis writes. Here `..._bucket`
+    # means somebody else's data bucket that a task reads from. Sharing
+    # one field would silently point a data connector at Praxis's own
+    # artifact store, and a deployment that legitimately uses both
+    # (artifacts in one bucket, customer data in another) could not
+    # express that at all.
+    #
+    # Unlike `S3BlobStore`, this does take explicit credentials. That is
+    # not a disagreement about whether botocore's ambient credential
+    # chain is preferable - it is that the chain gives no way to answer
+    # "is this connector configured?", and `build_registry` has to decide
+    # whether to register at all *before* any call is made. The key pair
+    # is therefore the registration gate; the other three refine where
+    # and what.
+    s3_connector_access_key_id: str | None = Field(
+        default=None, description="Access key ID for S3Connector"
+    )
+    s3_connector_secret_access_key: str | None = Field(
+        default=None, description="Secret access key for S3Connector"
+    )
+    # Unset means real AWS S3. Any other S3-compatible provider needs its
+    # own endpoint here (e.g. http://localhost:9000 for a local MinIO).
+    s3_connector_endpoint_url: str | None = Field(
+        default=None,
+        description="S3-compatible endpoint URL for S3Connector; unset means real AWS S3",
+    )
+    # botocore requires *a* region even for providers that ignore it
+    # entirely; the connector falls back to us-east-1 when this is unset
+    # rather than failing to construct a client.
+    s3_connector_region: str | None = Field(
+        default=None, description="AWS region name for S3Connector (defaults to us-east-1)"
+    )
+    s3_connector_bucket: str | None = Field(
+        default=None,
+        description="Default bucket for S3Connector reads given a bare key (no s3:// prefix)",
+    )
+
+    # The universal HTTP escape hatch: any JSON-over-HTTP API that has no
+    # dedicated connector. One base URL per deployment, because a
+    # connector is one *instance* of a configured system - a deployment
+    # needing two REST APIs registers the second by constructing a second
+    # `RESTConnector` directly, the same way `SQLConnector` is handled.
+    rest_base_url: str | None = Field(
+        default=None, description="Base URL of a JSON-over-HTTP API for RESTConnector"
+    )
+    # Split into name and value rather than one "Header: value" string so
+    # nothing has to parse a colon out of a credential that may itself
+    # contain colons (HTTP Basic's base64 of "user:pass" routinely does).
+    rest_auth_header_name: str | None = Field(
+        default=None,
+        description="Auth header name for RESTConnector (defaults to Authorization)",
+    )
+    rest_auth_header_value: str | None = Field(
+        default=None,
+        description="Auth header value for RESTConnector, e.g. 'Bearer ...'",
+    )
+
+    graphql_url: str | None = Field(
+        default=None, description="GraphQL endpoint URL for GraphQLConnector"
+    )
+    graphql_auth_header_name: str | None = Field(
+        default=None,
+        description="Auth header name for GraphQLConnector (defaults to Authorization)",
+    )
+    graphql_auth_header_value: str | None = Field(
+        default=None,
+        description="Auth header value for GraphQLConnector, e.g. 'Bearer ...'",
+    )
+
+    # Neo4j speaks Bolt, not HTTP - `neo4j://` (routing, for a cluster)
+    # or `bolt://` (a single instance), optionally +s/+ssc for TLS.
+    neo4j_uri: str | None = Field(
+        default=None, description="Bolt URI for Neo4jConnector, e.g. neo4j://localhost:7687"
+    )
+    neo4j_user: str | None = Field(default=None, description="Username for Neo4jConnector")
+    neo4j_password: str | None = Field(default=None, description="Password for Neo4jConnector")
+    # Neo4j Community Edition has exactly one database ("neo4j"), which
+    # the driver defaults to; this only matters on Enterprise/Aura, where
+    # a deployment may keep several.
+    neo4j_database: str | None = Field(
+        default=None,
+        description="Database name for Neo4jConnector; unset uses the server's default",
     )
 
     # Phase 11 (spec §16.2's "customer-db", §19's bootstrap philosophy).
@@ -169,7 +412,8 @@ class Settings(BaseSettings):
     # directly (not via the self-registering-factory mechanism the four
     # Phase 2 connectors use, since one entry here is one *instance*, not
     # one *type*). Setting, e.g.,
-    #   PRAXIS_MCP_SERVERS='[{"name": "example", "command": "npx", "args": ["-y", "some-mcp-server"]}]'
+    #   PRAXIS_MCP_SERVERS='[{"name": "example", "command": "npx",
+    #                         "args": ["-y", "some-mcp-server"]}]'
     # registers that MCP server as a connector with zero code changes -
     # the concrete proof that adding connector #N is a config entry, not
     # a new Python class. Defaults to empty: no MCP servers configured.

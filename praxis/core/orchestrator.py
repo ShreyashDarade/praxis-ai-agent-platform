@@ -59,8 +59,10 @@ from typing import Any, Protocol
 
 import structlog
 from langgraph.types import Command, interrupt
+from sqlalchemy import select
 
 from praxis.agents.planner import Planner
+from praxis.agents.publication import SkillStatus
 from praxis.agents.skill import Skill
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.config import Settings
@@ -77,7 +79,7 @@ from praxis.core.graph_engine import build_task_graph
 from praxis.core.interfaces import Connector, GraphStore
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
 from praxis.memory.db import PostgresStore
-from praxis.memory.models import Task
+from praxis.memory.models import SkillRecord, Task
 from praxis.observability.logging import bind_correlation_id
 from praxis.observability.tracing import start_span
 from praxis.safety.output_validation import validate_skill_output
@@ -88,6 +90,7 @@ from praxis.security.approval import (
     verify_approval_binding,
 )
 from praxis.security.audit import AuditLogger
+from praxis.security.policy import Permission, policy_engine
 from praxis.security.principal import SYSTEM_PRINCIPAL, Principal
 
 _logger = structlog.get_logger(__name__)
@@ -231,6 +234,7 @@ class Orchestrator:
         audit_logger: AuditLogger | None = None,
         approval_ttl_seconds: int | None = None,
         checkpointer: Any | None = None,
+        retain_checkpoints: bool | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
@@ -247,7 +251,45 @@ class Orchestrator:
         self._checkpointer = (
             checkpointer if checkpointer is not None else PraxisCheckpointSaver(store)
         )
+        self._retain_checkpoints = retain_checkpoints
         self._contexts: dict[str, _TaskContext] = {}
+
+    @property
+    def _retains_checkpoints(self) -> bool:
+        """Whether a finished task keeps its replayable history.
+
+        Read from `Settings` on demand rather than at construction, so a
+        deployment that flips it does not need every long-lived
+        Orchestrator rebuilt. Falls back to retaining: losing a failed
+        run's history is worse than keeping rows, and a Settings that
+        cannot be constructed must not silently turn the debug feature
+        off.
+        """
+        if self._retain_checkpoints is not None:
+            return self._retain_checkpoints
+        try:
+            from praxis.config import Settings as _Settings
+
+            return bool(_Settings().retain_checkpoints_after_completion)
+        except Exception:  # noqa: BLE001 - see docstring: fail toward retention
+            return True
+
+    async def _release_thread(self, task_id: str) -> None:
+        """Drops a terminal task's in-memory context, and its checkpoints
+        only when history is not being retained."""
+        self._contexts.pop(task_id, None)
+        if not self._retains_checkpoints:
+            await self._checkpointer.adelete_thread(task_id)
+
+    async def prune_task_history(self, task_id: str) -> None:
+        """Deletes a finished task's checkpoints explicitly.
+
+        The escape hatch for the retention default: an operator (or a
+        scheduled sweeper) reclaims the space for a run nobody needs to
+        replay any more. Deliberately not automatic - see
+        `Settings.retain_checkpoints_after_completion`.
+        """
+        await self._checkpointer.adelete_thread(task_id)
 
     @property
     def _approval_ttl(self) -> int:
@@ -309,7 +351,10 @@ class Orchestrator:
             task.result = {"error": message}
             await session.commit()
         await self._publish_state(task)
-        await self._checkpointer.adelete_thread(task_id)
+        # Retained by default: a failed run is the one an operator most
+        # wants to replay, so its history outlives it unless the
+        # deployment opted out.
+        await self._release_thread(task_id)
 
     @staticmethod
     def _build_result(
@@ -335,6 +380,41 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # The per-step node body - where every security control lives
     # ------------------------------------------------------------------ #
+
+    async def _approval_gate_blocks(
+        self, skill_name: str, context: _TaskContext
+    ) -> str | None:
+        """Why this skill may not run, or `None` if it may.
+
+        Only *synthesized* skills are gated. A hand-written skill is
+        already in version control and was reviewed by whoever merged
+        it; requiring a second approval at runtime would add ceremony
+        without adding scrutiny. The gate exists for code an LLM wrote
+        minutes ago, which nobody has read.
+        """
+        async with self._store.session() as session:
+            rows = (
+                await session.execute(
+                    select(SkillRecord).where(
+                        SkillRecord.tenant_id == context.principal.tenant_id,
+                        SkillRecord.name == skill_name,
+                    )
+                )
+            ).scalars().all()
+
+        synthesized = [row for row in rows if row.synthesized]
+        if not synthesized:
+            return None
+
+        if any(SkillStatus(row.status).is_callable for row in synthesized):
+            return None
+
+        statuses = sorted({row.status for row in synthesized})
+        return (
+            f"skill '{skill_name}' was synthesized but is not approved for execution "
+            f"(status: {', '.join(statuses)}); a principal with 'skill:approve' must "
+            "approve it first"
+        )
 
     @staticmethod
     def _settle_in_flight(
@@ -381,6 +461,7 @@ class Orchestrator:
             resolved_args = resolve_args(step.args, results)
 
             # --- resolve or synthesize the skill ---------------------- #
+            skill: Skill | None
             try:
                 skill = self._skills.get_skill(step.skill_name)
             except KeyError:
@@ -396,6 +477,27 @@ class Orchestrator:
                         "step_status": {index: "failed"},
                         "errors": [f"step {index}: {synthesis_error}"],
                     }
+
+            # --- the synthesis approval gate -------------------------- #
+            # A synthesized skill that has not been approved is
+            # refused HERE, at the point of execution. Recording it as
+            # `pending_approval` in the catalogue is only bookkeeping;
+            # this check is what makes the gate real (Prompt §7:
+            # "Generated agents/tools must never be silently
+            # trusted").
+            blocked = await self._approval_gate_blocks(skill.name, context)
+            if blocked is not None:
+                await self._update_checklist(task_id, index, status="failed", reason=blocked)
+                await self._audit.record(
+                    principal=context.principal,
+                    action="task:execute_step",
+                    resource_type="skill",
+                    resource_id=skill.name,
+                    decision="denied",
+                    reason=blocked,
+                    detail={"step": index, "skill": skill.name},
+                )
+                return {"step_status": {index: "failed"}, "errors": [blocked]}
 
             # --- execution-mode enforcement, layer 2 ------------------ #
             # A mutating skill that reached this plan despite layer 1 -
@@ -807,12 +909,16 @@ class Orchestrator:
         # `plan_only`: the plan IS the deliverable.
         if not mode.allows_execution:
             async with self._store.session() as session:
-                task = await session.get(Task, task_id)
-                assert task is not None
-                task.checklist = checklist
-                task.plan = _plan_to_json(steps)
-                task.status = "completed"
-                task.result = {
+                # A distinct name from the `task` created above: this is
+                # a re-read that may legitimately be absent, and reusing
+                # the name would conflate "the row I just created" with
+                # "whatever is in the database now".
+                stored = await session.get(Task, task_id)
+                assert stored is not None
+                stored.checklist = checklist
+                stored.plan = _plan_to_json(steps)
+                stored.status = "completed"
+                stored.result = {
                     "mode": mode.value,
                     "summary": (
                         f"Plan-only run: produced a {len(steps)}-step plan; nothing was executed."
@@ -828,17 +934,17 @@ class Orchestrator:
                     ],
                 }
                 await session.commit()
-            await self._publish_state(task)
+            await self._publish_state(stored)
             with bind_correlation_id(correlation_id):
                 _logger.info("task_plan_only_completed", task_id=task_id, steps=len(steps))
             return task_id
 
         async with self._store.session() as session:
-            task = await session.get(Task, task_id)
-            assert task is not None
-            task.checklist = checklist
-            task.plan = _plan_to_json(steps)
-            task.status = "running"
+            stored = await session.get(Task, task_id)
+            assert stored is not None
+            stored.checklist = checklist
+            stored.plan = _plan_to_json(steps)
+            stored.status = "running"
             await session.commit()
         await self._publish_state(task)
 
@@ -934,10 +1040,11 @@ class Orchestrator:
             task_id=task_id,
             steps=len(context.steps),
         )
-        self._contexts.pop(task_id, None)
-        # Terminal: nothing left to resume, so retaining the thread
-        # would only accumulate dead state.
-        await self._checkpointer.adelete_thread(task_id)
+        # Terminal: nothing left to resume. The checkpoints are kept
+        # anyway when history retention is on, because that is what
+        # makes `replay_history` a post-hoc debugging tool rather than
+        # one that only works while a task is still running.
+        await self._release_thread(task_id)
 
     async def _rebuild_context(self, task: Task) -> _TaskContext | None:
         """Reconstructs run context for a task this process never started.
@@ -982,6 +1089,39 @@ class Orchestrator:
                     f"task '{task_id}' is not awaiting approval (status: '{task.status}')"
                 )
             step_index = self._paused_index(task)
+
+            # Authorization is rechecked HERE, at the point of action,
+            # not only at the HTTP boundary (brief §8: "Recheck
+            # authorization when a paused or scheduled task resumes").
+            #
+            # The API route already requires `task:approve`, but this
+            # method is also reachable from the CLI and the schedule
+            # runner, and it is this method that actually performs the
+            # mutation. Same two-layer posture as execution modes: the
+            # outer layer keeps the action out of reach, the inner one
+            # refuses it anyway. `decide_approval` below binds tenant,
+            # arguments, expiry and idempotency - but it does not
+            # establish that the approver holds the permission at all.
+            try:
+                policy_engine.authorize(
+                    principal,
+                    Permission.TASK_APPROVE,
+                    resource_type="task",
+                    resource_id=task_id,
+                    resource_tenant_id=task.tenant_id,
+                )
+            except PermissionError as exc:
+                await self._audit.record(
+                    principal=principal,
+                    action="task:approve",
+                    resource_type="task",
+                    resource_id=task_id,
+                    decision="denied",
+                    reason=str(exc),
+                    detail={"step": step_index},
+                    correlation_id=task.correlation_id,
+                )
+                raise
 
             # Identity-bound, expiring, idempotent. A replayed call
             # resolves to the same record rather than re-authorizing.
@@ -1119,8 +1259,7 @@ class Orchestrator:
         with bind_correlation_id(correlation_id):
             _logger.info("task_cancelled", task_id=task_id, by=principal.describe())
 
-        self._contexts.pop(task_id, None)
-        await self._checkpointer.adelete_thread(task_id)
+        await self._release_thread(task_id)
         return True
 
     async def replay_history(self, task_id: str) -> list[dict[str, Any]]:

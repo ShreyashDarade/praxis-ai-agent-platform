@@ -16,7 +16,17 @@ purpose onto the cheapest model regardless of its default tier.
 **LLM response cache (Phase 7, spec §11)**: `complete()` is fronted by a
 `Cache` keyed on `(purpose, model, prompt, max_tokens, sorted **kwargs)`
 - an identical call within the cache's TTL returns the cached response
-text with zero real API call. `real_api_calls` is a plain counter
+text with zero real API call. The key is built through
+`praxis.cache.keys.CacheKey`, so when a caller passes a `principal` it
+also carries that principal's tenant and effective permissions, and the
+tenant is rechecked on the hit before the cached text is returned
+(brief §10: "Cache keys must include tenant, effective permissions ...
+Recheck authorization on cache hits"). `principal` is optional: a
+caller that has none - the auth-disabled single-operator deployment,
+and every call site written before tenancy existed - gets an
+untenanted key in a keyspace that cannot collide with any tenant's.
+The model id is part of the key, which is what makes a model swap a
+different entry rather than a stale one. `real_api_calls` is a plain counter
 attribute, incremented only immediately before an actual
 `client.messages.create` call - real, load-bearing testability (not
 guessed from wall-clock timing, which is flaky): a test asserting
@@ -26,13 +36,13 @@ network call happen," not on how long either call took.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 import anthropic
 
 from praxis.agents.budget import BudgetTracker
+from praxis.cache import scopes
+from praxis.cache.keys import CacheKey
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.core.interfaces import Cache
 from praxis.observability.metrics import (
@@ -41,6 +51,7 @@ from praxis.observability.metrics import (
     record_cache,
     record_llm_call,
 )
+from praxis.security.principal import Principal
 
 # Rough prompt-size estimate for the PRE-call budget check only. It
 # deliberately does not try to be accurate: the real token counts come
@@ -72,16 +83,36 @@ DEFAULT_MODEL_MAPPING: dict[str, str] = {
 # provider-side weights/behavior can change; a bounded TTL means a
 # long-running process eventually re-asks rather than serving a
 # same-process-lifetime-stale response forever.
-DEFAULT_CACHE_TTL_SECONDS = 3600
+# Read from `praxis.cache.scopes` rather than restated here, so the TTL
+# and the reasoning for it stay in one place.
+DEFAULT_CACHE_TTL_SECONDS = scopes.ttl_for(scopes.LLM_RESPONSE)
 
 
-def _cache_key(purpose: str, model: str, prompt: str, max_tokens: int, kwargs: dict[str, Any]) -> str:
-    payload = json.dumps(
-        {"purpose": purpose, "model": model, "prompt": prompt, "max_tokens": max_tokens, "kwargs": kwargs},
-        sort_keys=True,
-        default=str,
+def _cache_key(
+    purpose: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    kwargs: dict[str, Any],
+    principal: Principal | None = None,
+) -> CacheKey:
+    """The `llm_response` key for one completion.
+
+    The model id is named explicitly rather than left implicit in the
+    purpose: `DEFAULT_MODEL_MAPPING` is config, so the same purpose can
+    resolve to a different model after a redeploy, and a key that
+    omitted the model would serve the old model's answer as the new
+    one's.
+    """
+    return CacheKey.build(
+        scopes.LLM_RESPONSE,
+        principal,
+        purpose=purpose,
+        model=model,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        kwargs=kwargs,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class LLMCatalogue:
@@ -121,27 +152,39 @@ class LLMCatalogue:
             known = ", ".join(sorted(self._model_mapping)) or "(none registered)"
             raise ValueError(f"unknown LLM purpose '{purpose}' - known purposes: {known}") from None
 
-    async def complete(self, purpose: str, prompt: str, **kwargs: Any) -> str:
+    async def complete(
+        self, purpose: str, prompt: str, *, principal: Principal | None = None, **kwargs: Any
+    ) -> str:
         """Runs one completion against the model registered for `purpose`.
 
         A call with the same `(purpose, prompt, model, max_tokens,
-        **kwargs)` within the cache's TTL returns the cached response
-        text - no client is constructed and no API call is made at all
-        on a cache hit. On a miss, constructs a fresh
-        `anthropic.AsyncAnthropic()` client with no `api_key` kwarg -
-        the SDK reads `ANTHROPIC_API_KEY` from the environment by
-        default - and caches the concatenated text of every text
+        **kwargs)` - and the same tenant and effective permissions,
+        when a `principal` is supplied - within the cache's TTL returns
+        the cached response text: no client is constructed and no API
+        call is made at all on a cache hit. On a miss, constructs a
+        fresh `anthropic.AsyncAnthropic()` client with no `api_key`
+        kwarg - the SDK reads `ANTHROPIC_API_KEY` from the environment
+        by default - and caches the concatenated text of every text
         content block in the response before returning it.
+
+        `principal` is keyword-only and is never forwarded to the
+        provider: it identifies who is asking, which decides which
+        cache entry may be read, not what the model is asked.
         """
         model = self.model_for(purpose)
         max_tokens = kwargs.pop("max_tokens", 1024)
-        cache_key = _cache_key(purpose, model, prompt, max_tokens, kwargs)
+        cache_key = _cache_key(purpose, model, prompt, max_tokens, kwargs, principal)
 
-        cached = await self._cache.get(cache_key)
+        cached = await self._cache.get(cache_key.value)
         if cached is not None:
-            record_cache(True, scope="llm_response")
+            # Rechecked before the value is handed back, not merely
+            # implied by the key having matched (brief §10). With a
+            # shared Redis keyspace the key is not proof of who wrote
+            # the entry.
+            cache_key.authorize(principal)
+            record_cache(True, scope=scopes.LLM_RESPONSE)
             return cached
-        record_cache(False, scope="llm_response")
+        record_cache(False, scope=scopes.LLM_RESPONSE)
 
         # Phase 14: enforce the budget BEFORE the call, so an overrun
         # is prevented rather than merely recorded afterwards. No
@@ -181,5 +224,5 @@ class LLMCatalogue:
             cost_usd=cost_usd,
         )
 
-        await self._cache.set(cache_key, text, ttl_seconds=self._cache_ttl_seconds)
+        await self._cache.set(cache_key.value, text, ttl_seconds=self._cache_ttl_seconds)
         return text

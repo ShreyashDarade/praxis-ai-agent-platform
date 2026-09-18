@@ -31,14 +31,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from praxis.agents.budget import Budget
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -104,7 +104,7 @@ class TaskContract:
     @classmethod
     def child_of(
         cls,
-        parent: "TaskContract",
+        parent: TaskContract,
         *,
         objective: str,
         authorized_tools: tuple[str, ...] | None = None,
@@ -112,7 +112,7 @@ class TaskContract:
         output_schema: dict[str, str] | None = None,
         acceptance_criteria: list[AcceptanceCriterion] | None = None,
         budget: Budget | None = None,
-    ) -> "TaskContract":
+    ) -> TaskContract:
         """Derives a child contract that can never exceed its parent.
 
         Three inheritance rules, each closing a real escalation route:
@@ -149,7 +149,7 @@ class TaskContract:
             depth=parent.depth + 1,
         )
 
-    def with_deadline_in(self, seconds: float) -> "TaskContract":
+    def with_deadline_in(self, seconds: float) -> TaskContract:
         """Sets an absolute deadline `seconds` from now."""
         self.deadline = _utcnow() + timedelta(seconds=seconds)
         return self
@@ -160,7 +160,7 @@ class TaskContract:
             return False
         deadline = self.deadline
         if deadline.tzinfo is None:
-            deadline = deadline.replace(tzinfo=timezone.utc)
+            deadline = deadline.replace(tzinfo=UTC)
         return deadline <= _utcnow()
 
     def authorizes(self, tool_name: str) -> bool:

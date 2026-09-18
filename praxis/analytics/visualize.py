@@ -33,8 +33,9 @@ per chart family.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import pandas as pd
 import plotly.express as px
@@ -309,15 +310,101 @@ _CHART_SPECS: dict[str, _ChartSpec] = {
     "sankey": _ChartSpec(_build_sankey, required=("source", "target", "value")),
 }
 
-# Exported so a caller that has to *describe* the supported set (the
-# `create_chart` skill's input schema, which the Planner reads) can
-# derive it from the one definition above instead of hand-maintaining a
-# second list that silently goes stale.
+def register_chart_type(
+    name: str,
+    build: _ChartBuilder,
+    *,
+    required: tuple[str, ...] = (),
+    optional: tuple[str, ...] = (),
+    replace: bool = False,
+) -> None:
+    """Registers a custom chart type (brief §2's "configurable/custom
+    visualization types").
+
+    The same self-registering plugin shape the connectors, parsers and
+    skills use: a deployment adds one module that calls this at import
+    time and gets a new chart type with no edit to this file. `build`
+    receives the same `(frame, columns)` pair every built-in builder
+    does, so a custom type is not a second-class citizen - it flows
+    through the identical validation, export and capability-negotiation
+    paths.
+
+    Re-registering an existing name raises unless `replace=True`. Silent
+    replacement is the failure mode worth guarding: two plugins that
+    both call themselves `"gauge"` would otherwise resolve by import
+    order, and the loser would render as the winner with no error
+    anywhere. `replace=True` is the explicit way to override a built-in.
+    """
+    if not name or not name.strip():
+        raise ValueError("chart type name must be a non-empty string")
+    if name in _CHART_SPECS and not replace:
+        raise ValueError(
+            f"chart type '{name}' is already registered - pass replace=True to override it"
+        )
+
+    overlap = set(required) & set(optional)
+    if overlap:
+        # A role that is both required and optional has no defined
+        # meaning, and `render()` would enforce whichever tuple it
+        # happened to consult first.
+        raise ValueError(
+            f"chart type '{name}': roles {sorted(overlap)} declared both required and optional"
+        )
+
+    _CHART_SPECS[name] = _ChartSpec(build, required=required, optional=optional)
+    _refresh_supported_chart_types()
+
+
+# The built-in set, snapshotted at import. Exported for callers that
+# want *the shipped types* as a stable constant.
+#
+# This is deliberately NOT the way to ask "what can be drawn right
+# now": `register_chart_type` can add to `_CHART_SPECS` after this
+# module is imported, and a `from ... import SUPPORTED_CHART_TYPES`
+# binds this tuple once and never sees the addition. Anything
+# describing or validating against the live set must call
+# `PlotlyVisualizer.supported_chart_types()`, which reads `_CHART_SPECS`
+# at call time.
 SUPPORTED_CHART_TYPES: tuple[str, ...] = tuple(_CHART_SPECS)
+
+
+def _refresh_supported_chart_types() -> None:
+    """Keeps the module-level tuple in step after a registration.
+
+    Best-effort only, for the direct-importer case above; the
+    authoritative answer is always `_CHART_SPECS` itself.
+    """
+    global SUPPORTED_CHART_TYPES
+    SUPPORTED_CHART_TYPES = tuple(_CHART_SPECS)
 
 
 class PlotlyVisualizer(Visualizer):
     """The one concrete `Visualizer` this MVP ships (spec §13)."""
+
+    @staticmethod
+    def supported_chart_types() -> tuple[str, ...]:
+        """Every chart type this backend can actually draw, right now.
+
+        Exposed so a dashboard spec is validated against the
+        renderer's real capability rather than a hand-maintained
+        duplicate list that would drift out of step with
+        `_CHART_SPECS` the moment a type is added.
+
+        Reads `_CHART_SPECS` on every call rather than returning the
+        `SUPPORTED_CHART_TYPES` snapshot, so a type registered by a
+        plugin after import is honoured here too.
+        """
+        return tuple(_CHART_SPECS)
+
+    @staticmethod
+    def required_roles() -> dict[str, tuple[str, ...]]:
+        """Each chart type's required encoding roles, including any
+        registered by a plugin.
+
+        Read straight off the same specs `render()` validates
+        against, for the same no-drift reason.
+        """
+        return {name: spec.required for name, spec in _CHART_SPECS.items()}
 
     def render(
         self,
@@ -362,7 +449,8 @@ class PlotlyVisualizer(Visualizer):
         missing_roles = [role for role in spec.required if role not in encoding]
         if missing_roles:
             raise ValueError(
-                f"encoding is missing required role(s) {missing_roles} for chart_type {chart_type!r}"
+                f"encoding is missing required role(s) {missing_roles} "
+                f"for chart_type {chart_type!r}"
             )
 
         frame = pd.DataFrame(data)

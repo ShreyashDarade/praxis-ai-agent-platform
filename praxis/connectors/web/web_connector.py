@@ -46,7 +46,7 @@ from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
-from praxis.connectors.factory import ConnectorFactory, register_connector_factory
+from praxis.connectors.factory import ConnectorFactory, register_connector_factory, required
 from praxis.connectors.web import guarded_fetch, robots, untrusted
 from praxis.connectors.web.errors import (
     FETCH_ERRORS,
@@ -302,7 +302,7 @@ class WebConnector(Connector):
                     asyncio.gather(*(_fetch_one(u, d) for u, d in batch)),
                     timeout=remaining,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Wall-clock exhausted mid-batch: whatever individual
                 # pages had already completed and appended to
                 # `collected` before the timeout fired are kept (spec:
@@ -312,12 +312,14 @@ class WebConnector(Connector):
                 break
 
             next_depth = {u: d + 1 for u, d in batch}
-            for (batch_url, _), links in zip(batch, batch_results):
+            for (batch_url, _), links in zip(batch, batch_results, strict=True):
                 for link in links:
                     if link not in visited and len(visited) < max_pages:
                         frontier.append((link, next_depth[batch_url]))
 
-        combined_text = "\n\n---\n\n".join(f"[Source: {page_url}]\n{page_text}" for page_url, page_text in collected)
+        combined_text = "\n\n---\n\n".join(
+            f"[Source: {page_url}]\n{page_text}" for page_url, page_text in collected
+        )
 
         if not combined_text.strip():
             distilled = "(no content was successfully retrieved during the crawl)"
@@ -335,12 +337,18 @@ class WebConnector(Connector):
 
     async def _distill(self, text: str, *, question: str, source: str) -> str:
         prompt = self._prompt_manager.render(
-            _DISTILL_PROMPT_NAME, _DISTILL_PROMPT_VERSION, text=text, question=question, source=source
+            _DISTILL_PROMPT_NAME,
+            _DISTILL_PROMPT_VERSION,
+            text=text,
+            question=question,
+            source=source,
         )
         return await self._catalogue.complete("routing", prompt)
 
 
-def _extract_same_host_links(content: bytes, content_type: str, base_url: str, start_host: str) -> list[str]:
+def _extract_same_host_links(
+    content: bytes, content_type: str, base_url: str, start_host: str
+) -> list[str]:
     base_type = content_type.split(";")[0].strip().lower()
     if base_type not in ("text/html", "application/xhtml+xml"):
         return []
@@ -352,7 +360,10 @@ def _extract_same_host_links(content: bytes, content_type: str, base_url: str, s
     links: list[str] = []
     seen: set[str] = set()
     for tag in soup.find_all("a", href=True):
-        href = tag["href"].strip()
+        raw_href = tag["href"]
+        if not isinstance(raw_href, str):
+            continue
+        href = raw_href.strip()
         if not href or href.startswith(("#", "javascript:", "mailto:")):
             continue
         absolute = urljoin(base_url, href)
@@ -371,6 +382,10 @@ register_connector_factory(
     ConnectorFactory(
         name="web",
         is_configured=lambda settings: bool(settings.tavily_api_key),
-        build=lambda settings: WebConnector(search_provider=TavilySearchProvider(api_key=settings.tavily_api_key)),
+        build=lambda settings: WebConnector(
+            search_provider=TavilySearchProvider(
+                api_key=required(settings.tavily_api_key, setting="tavily_api_key")
+            )
+        ),
     )
 )

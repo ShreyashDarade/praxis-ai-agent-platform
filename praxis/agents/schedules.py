@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -174,14 +174,14 @@ def next_fire_time(schedule: Schedule, after: datetime) -> datetime:
     twice a year as a fixed-offset calculation would.
     """
     if after.tzinfo is None:
-        after = after.replace(tzinfo=timezone.utc)
+        after = after.replace(tzinfo=UTC)
 
     fire_time = schedule.trigger().get_next_fire_time(None, after)
     if fire_time is None:
         raise ScheduleError(
             f"schedule '{schedule.name}' has no future fire time"
         )
-    return fire_time.astimezone(timezone.utc)
+    return fire_time.astimezone(UTC)
 
 
 def missed_fire_times(
@@ -219,8 +219,8 @@ def run_idempotency_key(schedule_id: str, scheduled_for: datetime) -> str:
     second one's insert collides rather than executing a duplicate
     run - deduplication by construction rather than by locking.
     """
-    stamp = scheduled_for.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-    return hashlib.sha256(f"{schedule_id}:{stamp}".encode("utf-8")).hexdigest()[:48]
+    stamp = scheduled_for.astimezone(UTC).replace(microsecond=0).isoformat()
+    return hashlib.sha256(f"{schedule_id}:{stamp}".encode()).hexdigest()[:48]
 
 
 def should_start_run(

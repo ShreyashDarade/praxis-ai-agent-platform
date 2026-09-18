@@ -17,13 +17,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from praxis.api import main
-from praxis.api.dependencies import authorize_resource, require
+from praxis.api.dependencies import authorize_resource_or_404, require
 from praxis.config import Settings
 from praxis.core.events import task_event_bus, task_state_snapshot
 from praxis.core.execution_mode import ExecutionMode
@@ -71,6 +71,8 @@ async def create_intent(
     principal: Annotated[Principal, Depends(require(Permission.TASK_CREATE))],
 ) -> dict[str, Any]:
     """Ad-hoc ask -> a new `Task`, run through the Orchestrator (spec §14)."""
+    from praxis.api import main  # deferred: `main` imports this module
+
     orchestrator = main._get_orchestrator()
     task_id = await orchestrator.start_task(
         body.text,
@@ -145,6 +147,8 @@ async def webhook_alert(request: Request) -> dict[str, Any]:
     # machine-to-machine trigger, authenticated at the network/ingress
     # layer). Attributing it to a real user would be a lie in the audit
     # trail; attributing it to `system` is the truth.
+    from praxis.api import main  # deferred: `main` imports this module
+
     orchestrator = main._get_orchestrator()
     task_id = await orchestrator.start_task(intent_text, principal=SYSTEM_PRINCIPAL)
     return {"task_id": task_id}
@@ -169,15 +173,12 @@ async def get_task(
     finally:
         await store.dispose()
 
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
-
-    await authorize_resource(
+    task = await authorize_resource_or_404(
         principal,
         Permission.TASK_READ,
         resource_type="task",
         resource_id=task_id,
-        resource_tenant_id=task.tenant_id,
+        record=task,
     )
 
     return {
@@ -209,17 +210,17 @@ async def approve_task(
     try:
         async with store.session() as session:
             task = await session.get(Task, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
-        await authorize_resource(
+        task = await authorize_resource_or_404(
             principal,
             Permission.TASK_APPROVE,
             resource_type="task",
             resource_id=task_id,
-            resource_tenant_id=task.tenant_id,
+            record=task,
         )
     finally:
         await store.dispose()
+
+    from praxis.api import main  # deferred: `main` imports this module
 
     orchestrator = main._get_orchestrator()
     try:
@@ -265,17 +266,17 @@ async def cancel_task(
     try:
         async with store.session() as session:
             task = await session.get(Task, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
-        await authorize_resource(
+        task = await authorize_resource_or_404(
             principal,
             Permission.TASK_CANCEL,
             resource_type="task",
             resource_id=task_id,
-            resource_tenant_id=task.tenant_id,
+            record=task,
         )
     finally:
         await store.dispose()
+
+    from praxis.api import main  # deferred: `main` imports this module
 
     orchestrator = main._get_orchestrator()
     try:
@@ -311,14 +312,12 @@ async def clarify_task(
     try:
         async with store.session() as session:
             task = await session.get(Task, task_id)
-            if task is None:
-                raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
-            await authorize_resource(
+            task = await authorize_resource_or_404(
                 principal,
                 Permission.TASK_APPROVE,
                 resource_type="task",
                 resource_id=task_id,
-                resource_tenant_id=task.tenant_id,
+                record=task,
             )
             if task.status != "awaiting_clarification":
                 raise HTTPException(
@@ -448,12 +447,10 @@ async def stream_task(websocket: WebSocket, task_id: str) -> None:
                 disconnect_task.cancel()
             task_event_bus.unsubscribe(task_id, queue)
 
-        try:
+        # Already closed (e.g. the client disconnected first, above) -
+        # closing twice is a no-op, not an error worth surfacing.
+        with contextlib.suppress(RuntimeError):
             await websocket.close(code=1000)
-        except RuntimeError:
-            # Already closed (e.g. the client disconnected first, above) -
-            # closing twice is a no-op, not an error worth surfacing.
-            pass
     finally:
         await store.dispose()
 

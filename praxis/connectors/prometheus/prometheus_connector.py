@@ -6,7 +6,8 @@ from typing import Any
 
 import httpx
 
-from praxis.connectors.factory import ConnectorFactory, register_connector_factory
+from praxis.connectors.errors import describe_exception
+from praxis.connectors.factory import ConnectorFactory, register_connector_factory, required
 from praxis.core.interfaces import Connector, ConnectorDescription, HealthStatus
 
 
@@ -46,13 +47,15 @@ class PrometheusConnector(Connector):
                 detail=f"unexpected status {response.status_code}",
             )
         except Exception as exc:  # noqa: BLE001 - a health check must never raise
-            return HealthStatus(name=self.name, healthy=False, detail=str(exc))
+            return HealthStatus(name=self.name, healthy=False, detail=describe_exception(exc))
 
 
 register_connector_factory(
     ConnectorFactory(
         name="prometheus",
         is_configured=lambda settings: bool(settings.prometheus_url),
-        build=lambda settings: PrometheusConnector(base_url=settings.prometheus_url),
+        build=lambda settings: PrometheusConnector(
+            base_url=required(settings.prometheus_url, setting="prometheus_url")
+        ),
     )
 )

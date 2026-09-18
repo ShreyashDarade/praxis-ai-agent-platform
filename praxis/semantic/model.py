@@ -28,8 +28,8 @@ metric means underneath other callers.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -337,7 +337,7 @@ class SemanticLayer:
     # -- freshness ---------------------------------------------------- #
 
     def record_refresh(self, source: str, when: datetime | None = None) -> None:
-        self._last_refreshed[source] = when or datetime.now(timezone.utc)
+        self._last_refreshed[source] = when or datetime.now(UTC)
 
     def freshness_seconds(self, source: str) -> float | None:
         """Seconds since `source` was last refreshed, or `None` if
@@ -351,8 +351,8 @@ class SemanticLayer:
         if last is None:
             return None
         if last.tzinfo is None:
-            last = last.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - last).total_seconds()
+            last = last.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - last).total_seconds()
 
     def is_stale(self, metric_name: str) -> bool | None:
         """Whether a metric's source has breached its freshness SLA.

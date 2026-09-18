@@ -31,7 +31,7 @@ what was previously believed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -206,7 +206,7 @@ class MemoryStore:
         if not 0.0 <= confidence <= 1.0:
             raise ValueError(f"confidence must be in [0, 1], got {confidence}")
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         expires_at = now + timedelta(seconds=ttl_seconds) if ttl_seconds else None
 
         async with self._store.session() as session:
@@ -311,7 +311,7 @@ class MemoryStore:
             conditions.append(
                 or_(
                     MemoryEntry.expires_at.is_(None),
-                    MemoryEntry.expires_at > datetime.now(timezone.utc),
+                    MemoryEntry.expires_at > datetime.now(UTC),
                 )
             )
 
@@ -433,7 +433,7 @@ class MemoryStore:
         them out), so this is housekeeping rather than a correctness
         control - an unpurged expired entry is already invisible.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self._store.session() as session:
             stmt = select(MemoryEntry).where(
                 MemoryEntry.expires_at.is_not(None), MemoryEntry.expires_at <= now

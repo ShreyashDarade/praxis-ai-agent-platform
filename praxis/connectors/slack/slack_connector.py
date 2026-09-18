@@ -16,7 +16,8 @@ from typing import Any
 
 from slack_sdk.web.async_client import AsyncWebClient
 
-from praxis.connectors.factory import ConnectorFactory, register_connector_factory
+from praxis.connectors.errors import describe_exception
+from praxis.connectors.factory import ConnectorFactory, register_connector_factory, required
 from praxis.core.interfaces import Connector, ConnectorDescription, HealthStatus
 
 
@@ -62,13 +63,15 @@ class SlackConnector(Connector):
                 return HealthStatus(name=self.name, healthy=True)
             return HealthStatus(name=self.name, healthy=False, detail=str(response.data))
         except Exception as exc:  # noqa: BLE001 - a health check must never raise
-            return HealthStatus(name=self.name, healthy=False, detail=str(exc))
+            return HealthStatus(name=self.name, healthy=False, detail=describe_exception(exc))
 
 
 register_connector_factory(
     ConnectorFactory(
         name="slack",
         is_configured=lambda settings: bool(settings.slack_bot_token),
-        build=lambda settings: SlackConnector(bot_token=settings.slack_bot_token),
+        build=lambda settings: SlackConnector(
+            bot_token=required(settings.slack_bot_token, setting="slack_bot_token")
+        ),
     )
 )

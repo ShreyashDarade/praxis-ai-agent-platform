@@ -79,7 +79,8 @@ class MarkdownParser(Parser):
         # would drop alt text entirely. Substituting the alt text in
         # place keeps a diagram's caption in the extracted prose.
         for image in soup.find_all("img"):
-            image.replace_with(image.get("alt") or "")
+            alt = image.get("alt")
+            image.replace_with(alt if isinstance(alt, str) else "")
 
         # Block-by-block rather than one `get_text(separator="\n")` over
         # the whole tree: that separator would break *inline* elements

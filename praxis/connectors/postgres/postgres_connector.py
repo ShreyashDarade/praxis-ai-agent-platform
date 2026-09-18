@@ -21,6 +21,7 @@ from typing import Any
 
 import asyncpg
 
+from praxis.connectors.errors import describe_exception
 from praxis.core.interfaces import Connector, ConnectorDescription, HealthStatus
 
 # Defense in depth (spec §6 "safety net independent of LLM-authored
@@ -89,4 +90,4 @@ class PostgresConnector(Connector):
                 await conn.close()
             return HealthStatus(name=self.name, healthy=True)
         except Exception as exc:  # noqa: BLE001 - a health check must never raise
-            return HealthStatus(name=self.name, healthy=False, detail=str(exc))
+            return HealthStatus(name=self.name, healthy=False, detail=describe_exception(exc))

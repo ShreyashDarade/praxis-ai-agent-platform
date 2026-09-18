@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -75,7 +75,7 @@ class FilterSpec:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "FilterSpec":
+    def from_dict(cls, payload: dict[str, Any]) -> FilterSpec:
         return cls(
             dimension=payload["dimension"],
             operator=payload.get("operator", "eq"),
@@ -113,7 +113,7 @@ class QueryProvenance:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "QueryProvenance":
+    def from_dict(cls, payload: dict[str, Any]) -> QueryProvenance:
         executed = payload.get("executed_at")
         return cls(
             connector=payload.get("connector", ""),
@@ -174,7 +174,7 @@ class PanelSpec:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "PanelSpec":
+    def from_dict(cls, payload: dict[str, Any]) -> PanelSpec:
         return cls(
             panel_id=payload.get("panel_id") or str(uuid.uuid4()),
             title=payload["title"],
@@ -209,7 +209,7 @@ class DashboardSpec:
     # Spec-format version, so a stored dashboard read back by a later
     # release can be migrated rather than silently misinterpreted.
     spec_version: int = 1
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,7 +225,7 @@ class DashboardSpec:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "DashboardSpec":
+    def from_dict(cls, payload: dict[str, Any]) -> DashboardSpec:
         created = payload.get("created_at")
         return cls(
             dashboard_id=payload.get("dashboard_id") or str(uuid.uuid4()),
@@ -237,7 +237,7 @@ class DashboardSpec:
             filters=[FilterSpec.from_dict(f) for f in payload.get("filters") or []],
             panels=[PanelSpec.from_dict(p) for p in payload.get("panels") or []],
             created_at=(
-                datetime.fromisoformat(created) if created else datetime.now(timezone.utc)
+                datetime.fromisoformat(created) if created else datetime.now(UTC)
             ),
         )
 

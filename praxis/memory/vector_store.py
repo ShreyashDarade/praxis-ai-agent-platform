@@ -55,22 +55,21 @@ class PgVectorStore(VectorStore):
         # mime_type, chunk_index, ...) with no duplicated text.
         metadata = dict(metadata)
         content = str(metadata.pop("content", ""))
-        async with self._store.session() as session:
-            async with session.begin():
-                await session.execute(
-                    delete(VectorChunk).where(
-                        VectorChunk.doc_id == doc_id, VectorChunk.tenant_id == tenant_id
-                    )
+        async with self._store.session() as session, session.begin():
+            await session.execute(
+                delete(VectorChunk).where(
+                    VectorChunk.doc_id == doc_id, VectorChunk.tenant_id == tenant_id
                 )
-                session.add(
-                    VectorChunk(
-                        tenant_id=tenant_id,
-                        doc_id=doc_id,
-                        content=content,
-                        embedding=embedding,
-                        chunk_metadata=metadata,
-                    )
+            )
+            session.add(
+                VectorChunk(
+                    tenant_id=tenant_id,
+                    doc_id=doc_id,
+                    content=content,
+                    embedding=embedding,
+                    chunk_metadata=metadata,
                 )
+            )
 
     async def similarity_search(
         self,

@@ -40,7 +40,8 @@ concurrently: two steps finishing in the same superstep both write
 from __future__ import annotations
 
 import operator
-from typing import Annotated, Any, Awaitable, Callable, TypedDict
+from collections.abc import Awaitable, Callable
+from typing import Annotated, Any, TypedDict
 
 import structlog
 from langgraph.errors import GraphInterrupt

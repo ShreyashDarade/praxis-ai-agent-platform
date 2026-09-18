@@ -71,6 +71,17 @@ class Role(str, Enum):
     VIEWER = "viewer"
 
 
+# The one reason string used for *every* "you cannot have this
+# resource" outcome - another tenant owns it, or it does not exist at
+# all. Shared as a constant rather than written twice because the whole
+# point is that the two are indistinguishable: a reader of their own
+# tenant's audit trail must not be able to tell which happened, and two
+# separately-maintained strings would eventually diverge and leak it.
+#
+# `praxis.api.dependencies.authorize_resource` uses this for the
+# not-found case; `PolicyEngine.check` uses it for the cross-tenant one.
+UNAVAILABLE_REASON = "resource is not available to this principal"
+
 _ALL_PERMISSIONS: frozenset[Permission] = frozenset(Permission)
 
 _VIEWER_PERMISSIONS: frozenset[Permission] = frozenset(
@@ -209,13 +220,30 @@ class PolicyEngine:
                 tenant_id=principal.tenant_id,
                 resource_type=resource_type,
                 resource_id=resource_id,
-                reason=(
-                    f"tenant isolation: resource belongs to tenant "
-                    f"'{resource_tenant_id}', principal is in '{principal.tenant_id}'"
-                ),
+                # Deliberately does NOT name the owning tenant, and is
+                # deliberately the same string used when the resource
+                # does not exist at all (see `UNAVAILABLE_REASON`).
+                #
+                # This reason is audited, and `GET /admin/audit` serves a
+                # tenant its own rows - so naming the owner here handed
+                # an admin who probes ids exactly the existence oracle
+                # the 404 response exists to deny, plus the other
+                # tenant's id. "Not yours" is the whole decision; whose
+                # it is, and whether it exists, are not the asker's
+                # business.
+                #
+                # `TenantIsolationError` below still carries both ids as
+                # attributes for a platform operator debugging in
+                # process; they just do not reach a tenant-readable row.
+                reason=UNAVAILABLE_REASON,
             )
 
         if permission not in self.effective_permissions(principal):
+            scope_note = (
+                f"narrowed by key scopes {list(principal.scopes)} "
+                if principal.scopes is not None
+                else ""
+            )
             return PolicyDecision(
                 allowed=False,
                 permission=permission.value,
@@ -225,7 +253,7 @@ class PolicyEngine:
                 resource_id=resource_id,
                 reason=(
                     f"principal roles {list(principal.roles)} "
-                    f"{'narrowed by key scopes ' + str(list(principal.scopes)) if principal.scopes is not None else ''}"
+                    f"{scope_note}"
                     f"do not grant '{permission.value}'"
                 ),
             )

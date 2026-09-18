@@ -22,7 +22,6 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
-from praxis.api import main
 from praxis.api.dependencies import require
 from praxis.config import Settings
 from praxis.ingestion.parsers import registry as parser_registry
@@ -54,6 +53,14 @@ async def upload_attachment(
     data = await file.read()
     mime_type = file.content_type or "application/octet-stream"
     source = file.filename or "upload"
+
+    # Imported inside the handler, not at module scope: `main` imports
+    # this module (to mount the router), so a module-level import here
+    # is a genuine cycle that resolves today only because of import
+    # ordering. Deferring it to call time removes the cycle without
+    # moving the shared embedder out of `main`, which is built once at
+    # import time precisely so every request shares one model.
+    from praxis.api import main
 
     try:
         settings = Settings()
@@ -134,7 +141,9 @@ async def get_artifact(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"invalid artifact key: {exc}") from exc
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"no artifact stored under key '{key}'") from None
+        raise HTTPException(
+            status_code=404, detail=f"no artifact stored under key '{key}'"
+        ) from None
 
     mime_type = mimetypes.guess_type(key)[0] or "application/octet-stream"
     return Response(content=data, media_type=mime_type)

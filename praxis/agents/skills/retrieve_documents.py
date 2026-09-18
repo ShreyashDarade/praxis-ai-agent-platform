@@ -23,8 +23,8 @@ from praxis.agents.skill_registry import register_skill
 from praxis.config import Settings
 from praxis.ingestion.embedders.sentence_transformer_embedder import get_default_embedder
 from praxis.ingestion.pipeline import retrieve
-from praxis.memory.models import DEFAULT_TENANT_ID
 from praxis.memory.db import PostgresStore
+from praxis.memory.models import DEFAULT_TENANT_ID
 from praxis.memory.vector_store import PgVectorStore
 
 _DEFAULT_TOP_K = 5
@@ -33,7 +33,16 @@ _DEFAULT_TOP_K = 5
 class RetrieveDocumentsSkill(Skill):
     name = "retrieve_documents"
     risk = "read_only"
-    inputs = {"query": "text to search for"}
+    inputs = {
+        "query": (
+            "text to search for. Semantic retrieval over document prose - use "
+            "it for questions answered by what a document *says*. Do NOT use it "
+            "to compute a number from an uploaded spreadsheet (a sum, count, "
+            "average, min/max or ranking): similarity search returns text that "
+            "resembles an answer, which is not the same as the correct total. "
+            "Use `query_table` for that."
+        )
+    }
     outputs = {"results": "list of matching document chunks"}
 
     async def run(self, **kwargs: Any) -> Any:

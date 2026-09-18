@@ -18,7 +18,8 @@ in development and then fails in production.
 """
 from __future__ import annotations
 
-from typing import Annotated, Callable
+from collections.abc import Callable
+from typing import Annotated, TypeVar
 
 import structlog
 from fastapi import Depends, Header, HTTPException, Request
@@ -32,10 +33,10 @@ from praxis.security.authentication import (
     extract_credential,
 )
 from praxis.security.policy import (
+    UNAVAILABLE_REASON,
     Permission,
-    PermissionDeniedError,
+    PolicyDecision,
     PolicyEngine,
-    TenantIsolationError,
     policy_engine,
 )
 from praxis.security.principal import SYSTEM_PRINCIPAL, Principal
@@ -124,10 +125,22 @@ def require(permission: Permission) -> Callable[..., object]:
         principal: CurrentPrincipal,
         settings: Annotated[Settings, Depends(get_settings)],
     ) -> Principal:
+        # The resource *type*, not the request path. `AuditLog.
+        # resource_type` is a String(64), and a path longer than that
+        # (every `/artifacts/t/<uuid>/...` fetch, for one) made the
+        # INSERT raise - which `AuditLogger.record` deliberately
+        # swallows so an audit failure cannot break the caller. The two
+        # together meant those requests were silently unaudited.
+        #
+        # Every `Permission` is spelled `<resource>:<verb>`, so the part
+        # before the colon is the type and is bounded by construction.
+        # The full path is still recorded, in `detail` below, where the
+        # column is unbounded.
+        resource_type = permission.value.split(":", 1)[0]
         decision = policy_engine.check(
             principal,
             permission,
-            resource_type=request.url.path,
+            resource_type=resource_type,
         )
 
         store = PostgresStore(settings)
@@ -160,7 +173,7 @@ async def authorize_resource(
     *,
     resource_type: str,
     resource_id: str,
-    resource_tenant_id: str,
+    resource_tenant_id: str | None,
     engine: PolicyEngine = policy_engine,
 ) -> None:
     """Second-stage ABAC check, once a route has actually loaded the row.
@@ -177,16 +190,46 @@ async def authorize_resource(
 
     A cross-tenant reference raises 404 rather than 403 on purpose: a
     403 would confirm the resource exists in *some* tenant, which is
-    itself a cross-tenant information leak. The audit row records the
-    real `TenantIsolationError` reason regardless.
+    itself a cross-tenant information leak.
+
+    **`resource_tenant_id=None` means the row was not found**, and a
+    route must call this in that case too rather than raising 404 on its
+    own. The two outcomes are then indistinguishable from outside in
+    every channel a tenant can observe:
+
+    - the HTTP response is the same 404;
+    - an audit row is written either way, so the *presence* of a row is
+      not itself an oracle - previously, probing a real id owned by
+      someone else produced a row while probing a nonexistent id
+      produced none, and an admin reading their own `/admin/audit` could
+      tell the two apart;
+    - the audited reason is the same string for both.
+
+    The real distinction survives only in the structlog warning below,
+    which goes to operators rather than into a tenant-readable table.
+    Recording the not-found case is also a gain in its own right:
+    sustained probing for ids that do not exist is what enumeration
+    looks like.
     """
-    decision = engine.check(
-        principal,
-        permission,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        resource_tenant_id=resource_tenant_id,
-    )
+    if resource_tenant_id is None:
+        decision = PolicyDecision(
+            allowed=False,
+            permission=permission.value,
+            principal=principal.describe(),
+            tenant_id=principal.tenant_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            # Deliberately identical to the cross-tenant reason.
+            reason=UNAVAILABLE_REASON,
+        )
+    else:
+        decision = engine.check(
+            principal,
+            permission,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            resource_tenant_id=resource_tenant_id,
+        )
 
     store = PostgresStore(Settings())
     try:
@@ -209,3 +252,49 @@ async def authorize_resource(
             status_code=404, detail=f"no {resource_type} with id '{resource_id}'"
         )
     raise HTTPException(status_code=403, detail=decision.reason)
+
+
+_ResourceT = TypeVar("_ResourceT")
+
+
+async def authorize_resource_or_404(
+    principal: Principal,
+    permission: Permission,
+    *,
+    resource_type: str,
+    resource_id: str,
+    record: _ResourceT | None,
+    engine: PolicyEngine = policy_engine,
+) -> _ResourceT:
+    """`authorize_resource`, for the usual "load the row then check it" shape.
+
+    Replaces the pattern every route was repeating::
+
+        if record is None:
+            raise HTTPException(404, ...)          # <- audited nowhere
+        await authorize_resource(..., record.tenant_id)
+
+    The early raise was the bug: a probe for an id that exists in
+    another tenant produced an audit row, and a probe for one that
+    exists nowhere produced none - so an admin reading their own
+    `/admin/audit` could tell the two apart, which is exactly the
+    existence oracle the 404 is there to deny. Routing both through
+    `authorize_resource` makes the observable trail identical.
+
+    Returns the record, so the caller gets the non-`None` narrowing for
+    free rather than needing a second check.
+    """
+    await authorize_resource(
+        principal,
+        permission,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        resource_tenant_id=None if record is None else getattr(record, "tenant_id", None),
+        engine=engine,
+    )
+    if record is None:
+        # Unreachable: `authorize_resource` raises 404 for a `None`
+        # tenant. Kept so the return type is honest rather than relying
+        # on a `NoReturn` the checker cannot infer conditionally.
+        raise HTTPException(status_code=404, detail=f"no {resource_type} with id '{resource_id}'")
+    return record

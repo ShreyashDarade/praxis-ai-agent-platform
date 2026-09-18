@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Any, TypeVar
 
 import structlog
 
@@ -148,15 +149,17 @@ class DelegationRegistry:
         parent_id = child.parent_id
         if parent_id is not None:
             parent = self._nodes.get(parent_id)
-            if parent is not None:
-                if len(parent.children) + 1 > self._limits.max_children_per_task:
-                    raise DelegationLimitError(
-                        (
-                            f"task '{parent_id}' already has {len(parent.children)} children, "
-                            f"at the maximum of {self._limits.max_children_per_task}"
-                        ),
-                        limit="children",
-                    )
+            if (
+                parent is not None
+                and len(parent.children) + 1 > self._limits.max_children_per_task
+            ):
+                raise DelegationLimitError(
+                    (
+                        f"task '{parent_id}' already has {len(parent.children)} children, "
+                        f"at the maximum of {self._limits.max_children_per_task}"
+                    ),
+                    limit="children",
+                )
 
             fingerprint = _objective_fingerprint(child.objective)
             # Cycle detection: the child's own parent chain must not

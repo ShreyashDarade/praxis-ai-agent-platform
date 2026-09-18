@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import io
-from typing import Iterator
+from collections.abc import Iterator
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE

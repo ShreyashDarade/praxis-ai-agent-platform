@@ -19,16 +19,16 @@ parsing in particular is "an additional check, not the security
 boundary" - the database's own permissions remain the real boundary,
 and `sql_guard` says so in its own docstring rather than overclaiming.
 """
+from praxis.safety.output_validation import (
+    OutputValidationError,
+    validate_skill_output,
+)
 from praxis.safety.sql_guard import (
     QueryCostLimits,
     SqlGuard,
     SqlGuardError,
     SqlStatementKind,
     UnsafeQueryError,
-)
-from praxis.safety.output_validation import (
-    OutputValidationError,
-    validate_skill_output,
 )
 from praxis.safety.untrusted import (
     UNTRUSTED_CLOSE,

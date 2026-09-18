@@ -74,11 +74,15 @@ class DocumentEnrichment:
 
     async def enrich(self, text: str) -> EnrichmentResult:
         """Summary + topics only - no graph writes (default ingestion path)."""
-        prompt = self._prompt_manager.render(_SUMMARIZE_PROMPT_NAME, _SUMMARIZE_PROMPT_VERSION, text=text)
+        prompt = self._prompt_manager.render(
+            _SUMMARIZE_PROMPT_NAME, _SUMMARIZE_PROMPT_VERSION, text=text
+        )
         response = await self._catalogue.complete("routing", prompt)
         return _parse_enrichment_response(response)
 
-    async def enrich_and_link(self, text: str, doc_id: str, graph_store: GraphStore) -> EnrichmentResult:
+    async def enrich_and_link(
+        self, text: str, doc_id: str, graph_store: GraphStore
+    ) -> EnrichmentResult:
         """Same summarization, plus entity extraction written to `graph_store`.
 
         One `mentions` edge is written per extracted entity:

@@ -32,6 +32,13 @@ dependencies = [
     "pytesseract>=0.3.13,<0.4",
     "pypdfium2>=5.13,<6.0",
     "pandas>=3.0,<4.0",
+    # Typed tables + exact aggregation over uploaded spreadsheets
+    # (brief §4's "do not rely on embeddings for exact aggregations").
+    # Chosen over pandasql/SQLite because SQLite's dynamic typing is the
+    # opposite of "typed tables", and its float arithmetic loses cents
+    # where DuckDB's decimal arithmetic does not. See
+    # `praxis/ingestion/tables.py`.
+    "duckdb>=1.1,<2.0",
     "sentence-transformers>=6.0,<7.0",
     "langchain-text-splitters>=1.1,<2.0",
     "pillow>=12.3,<13.0",
@@ -120,6 +127,45 @@ dependencies = [
     # resolved and verified in this venv, same discipline as every pin
     # above.
     "markdown-it-py>=4.2,<5.0",
+    # NOTE: `redis` and `aioboto3` are deliberately NOT here - they are
+    # optional managed services, declared under
+    # [project.optional-dependencies] as the `redis` and `s3` extras.
+    # See the rationale there; the brief asks for exactly this split
+    # ("Separate application requirements from optional managed
+    # services"), and it is what keeps a base install's `pip check`
+    # clean.
+    # Data-source connectors (spec §6). Six were added together; three of
+    # them - elasticsearch, rest, graphql - deliberately add NO dependency
+    # at all, because they speak JSON over HTTP and `httpx` is already the
+    # transport for `GitHubConnector` and `PrometheusConnector`. The
+    # official Elasticsearch client was rejected on purpose: its major
+    # versions are coupled to server major versions and it product-checks
+    # the `X-elastic-product` response header, so depending on it would
+    # smuggle a *server* requirement into this file and lock OpenSearch
+    # out entirely (see
+    # `praxis/connectors/elasticsearch/elasticsearch_connector.py`).
+    # A fourth, `praxis/connectors/s3/s3_connector.py`, adds nothing new
+    # either - it reuses the `aioboto3` entry directly above, for the same
+    # reason that one exists: signing an S3 request means a canonical
+    # request with exactly-once URI encoding, byte-sorted query
+    # parameters, a matching signed-headers list, a payload hash and a
+    # four-stage HMAC key derivation, with per-vendor deviations across
+    # every S3-compatible provider and one opaque `SignatureDoesNotMatch`
+    # for every mistake. Swapping AWS's own implementation of that for a
+    # novel one to save a dependency is a bad trade.
+    #
+    # The two below are the cases where there genuinely is no
+    # JSON-over-HTTP API to talk to. Each pinned to the version actually
+    # resolved and verified in this venv, same discipline as every pin
+    # above.
+    #
+    # NOTE: the vendor drivers those connectors need - `motor` (MongoDB),
+    # `neo4j`, `aioboto3` (S3) - are NOT here. They are per-datastore
+    # extras under [project.optional-dependencies], for the same reason
+    # `redis` and `aioboto3` are: a deployment that does not use MongoDB
+    # has no business installing an end-of-life MongoDB driver. Connector
+    # discovery treats a driver that is not installed as "this connector
+    # is unavailable", never as an error.
 ]
 
 # Windows-only caveat, discovered and fixed while verifying this exact
@@ -148,7 +194,95 @@ dependencies = [
 # supported platform) are unaffected.
 
 [project.optional-dependencies]
+# --- Optional managed services -----------------------------------------
+#
+# The brief: "Separate application requirements from optional managed
+# services." Praxis runs fully without either of these - the defaults
+# are `InMemoryCache` and `LocalBlobStore`, which are real
+# implementations, not stubs. These extras swap in a managed backend.
+#
+# Both are genuinely optional at import time too: nothing in `praxis`
+# imports `redis` or `aioboto3` unconditionally, and the connector
+# discovery in `praxis/connectors/bootstrap.py` treats a connector
+# whose optional dependency is absent as simply unavailable rather than
+# as an error.
+
+# Distributed cache. The asyncio client ships inside the main `redis`
+# package as `redis.asyncio` (the separate `aioredis` distribution was
+# merged into it and is abandoned; do not add it). Capped below 7.0 for
+# the same reason every other major is capped here: the 6.x client API
+# is what this was written and verified against.
+redis = ["redis>=6.4,<7.0"]
+
+# Object storage: `praxis/memory/s3_blob_store.py`'s `S3BlobStore` and
+# `praxis/connectors/s3/s3_connector.py`.
+#
+# KNOWN CONFLICT, verified rather than assumed, and the reason this is
+# an extra rather than a base dependency: aioboto3 15.5.0 pins
+# `aiobotocore==2.25.1`, which declares `wrapt<2.0.0`, while
+# `unstructured` (a base dependency) declares `wrapt>=2.1.1`. The two
+# cannot both be satisfied, so installing this extra makes `pip check`
+# report a conflict. It is resolved in favour of `unstructured` (keep
+# wrapt 2.x): aioboto3's S3 client was exercised directly against wrapt
+# 2.4.1 - client construction and a real request/response cycle both
+# work - so aiobotocore's cap is conservative rather than load-bearing
+# for the object-storage path Praxis uses. The alternative, aiobotocore
+# 3.x, drops the cap but requires `aiohttp>=3.14`, contradicting the
+# `aiohttp<3.11` dev pin below and breaking the Slack connector's whole
+# test suite to fix a warning.
+#
+# Keeping this out of the base install means the conflict is something
+# a deployment opts into knowingly, not something every install hits.
+s3 = ["aioboto3>=15.5,<16.0"]
+
+# --- Optional connector drivers ----------------------------------------
+#
+# One extra per datastore whose connector needs a vendor driver. The
+# connectors that speak JSON over HTTP (elasticsearch, rest, graphql,
+# github, prometheus, slack, web) need nothing here - `httpx` is a base
+# dependency and is their whole transport.
+
+# MongoDB's own asyncio driver, a thin async facade over `pymongo`
+# maintained by MongoDB Inc. The wire protocol is binary BSON over
+# custom framing - not something to reimplement over httpx - and
+# `pymongo` alone is synchronous, so it would block the event loop on
+# every round trip. It also brings the `bson` codec the connector needs
+# anyway, to convert BSON results into JSON-safe Extended JSON.
+#
+# Known migration debt, stated rather than hidden: MongoDB has folded
+# async support into `pymongo` itself (`AsyncMongoClient`) and put
+# `motor` into maintenance with an announced end of life. The API
+# surface this connector touches is identical in name and signature on
+# both, and nothing else in Praxis imports `motor`, so that migration is
+# an import swap plus a re-run of the connector's tests. Being an extra
+# means a deployment that does not use MongoDB never installs it at all.
+mongodb = ["motor>=3.7,<4.0"]
+
+# The vendor's own driver. Neo4j speaks Bolt (binary, packstream-framed,
+# with its own handshake and version negotiation), and the `neo4j://`
+# routing scheme a clustered deployment needs is implemented only here;
+# the HTTP alternative is Neo4j's deprecated path and has no routing. It
+# also buys the thing that makes `Neo4jConnector` read-only for real
+# rather than by regex: a Bolt transaction carries a READ/WRITE access
+# mode the *server* enforces, including against writes inside stored
+# procedures, which no client-side parse could ever see into.
+neo4j = ["neo4j>=5.28,<6.0"]
+
+# Convenience: every optional managed service and connector driver.
+# Installing this pulls in the aioboto3/wrapt conflict described above.
+all = [
+    "redis>=6.4,<7.0",
+    "aioboto3>=15.5,<16.0",
+    "motor>=3.7,<4.0",
+    "neo4j>=5.28,<6.0",
+]
+
 dev = [
+    # The test suite exercises every connector and both cache/blob
+    # backends, so a dev install needs every optional driver. This is
+    # also what keeps the extras honest: if an extra's package were
+    # wrong, the suite would fail rather than silently skip.
+    "praxis[all]",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
@@ -174,6 +308,16 @@ dev = [
     # failure instead of a silent block; see [tool.pytest.ini_options]'s
     # `timeout` setting below for the actual bound.
     "pytest-timeout>=2.4,<3.0",
+    # Lint + type check (the product brief's stack names both). Pinned to
+    # the versions actually resolved and verified against this codebase,
+    # same discipline as every runtime pin above - and here the pin is
+    # load-bearing in a second way: ruff ships new rules in minor
+    # releases, so an unbounded `>=` would let a fresh install fail CI on
+    # findings that did not exist when the code was written. Upgrading is
+    # a deliberate act (bump the cap, re-run, fix or configure), not
+    # something an unrelated `pip install` does silently.
+    "ruff>=0.14,<0.15",
+    "mypy>=1.20,<2.0",
 ]
 
 [project.scripts]
@@ -195,3 +339,152 @@ testpaths = ["tests"]
 # individually to accommodate that, rather than raising this global
 # default for every other test.
 timeout = 90
+
+# 100 columns, which is what this codebase was already written to by
+# hand - the point of stating it is that it stops being a convention
+# people remember and starts being a rule a tool enforces.
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# E/F  - pycodestyle errors + pyflakes: unused imports and variables,
+#        undefined names, f-strings with no placeholders. The findings
+#        that are almost always a genuine mistake.
+# I    - import sorting. Mechanical, but it is the one thing that
+#        reliably turns an import block into a merge conflict when it
+#        is left to taste, and this repo has several contributors.
+# UP   - pyupgrade. The project requires Python >= 3.11, so `typing.Callable`,
+#        `datetime.timezone.utc` and quoted forward references are all
+#        carrying weight for interpreters this package cannot run on.
+# B    - bugbear: mutable defaults, `zip()` without `strict=`, `assert False`
+#        (which `python -O` deletes). Real defects, not style.
+# SIM  - flake8-simplify, kept because its findings here were genuine
+#        (a `try/except/pass` that `contextlib.suppress` states more
+#        clearly, a nested `with` that reads as one).
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Import-for-side-effect and re-export are both load-bearing patterns
+# here (connectors, parsers, skills and specialists all self-register at
+# import time), and a package's `__init__.py` is where they land. F401
+# cannot tell that apart from a forgotten import.
+"**/__init__.py" = ["F401"]
+# E501 is enforced on shipped code but not on tests. Every one of the
+# ~70 pre-existing violations under `tests/` is a long string literal -
+# a fixture URL, a SQL statement, a JSON payload, an assertion message -
+# that ruff's own formatter could not split either, and breaking them
+# across lines makes the fixture harder to read against the real payload
+# it mirrors. Nothing about a too-long line in a test can produce a
+# defect in the product, so this buys clarity at no cost.
+"tests/**" = ["E501"]
+
+[tool.ruff.lint.isort]
+# The repository root holds a `docker/` directory of compose fixtures,
+# which makes ruff's import classifier read the installed docker-py SDK
+# as first-party and sort `import docker` into the local-imports block.
+known-third-party = ["docker"]
+
+[tool.ruff.lint.flake8-bugbear]
+# B008 exists to catch a mutable default evaluated once at definition
+# time. For FastAPI and Typer the call in the default *is* the API - it
+# is how a parameter is declared, and moving it into the body breaks the
+# framework's signature introspection. Listing them is the correct fix;
+# a blanket B008 ignore would also hide the real mutable-default bugs
+# the rule is for.
+extend-immutable-calls = [
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Depends",
+    "typer.Option",
+    "typer.Argument",
+]
+
+# Deliberately NOT `strict = true`. This is a large codebase written
+# before a type checker was ever run over it, and `strict` reports
+# thousands of missing-annotation findings on code that is otherwise
+# correct - a number nobody triages, so the checker gets switched off
+# instead and catches nothing. The settings below are the subset that
+# finds real bugs in unannotated code rather than reporting its absence:
+# `check_untyped_defs` type-checks function bodies that have no
+# signature annotations (most of the value here), `no_implicit_optional`
+# refuses the silent `= None` widening, and the two `warn_*` flags
+# report suppressions and casts that have stopped being true - i.e. they
+# keep the configuration itself honest as the code changes. Tightening
+# from here is a per-module `[[tool.mypy.overrides]]` as each subsystem
+# gets annotated, not a single flag flip that produces an unreadable
+# report.
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# `Settings` is a pydantic-settings `BaseSettings`: every field it
+# declares can arrive from the environment or the `.env` file, so
+# `Settings()` with no arguments is the *normal* call and the one this
+# codebase makes everywhere. Without this plugin mypy synthesizes an
+# `__init__` from the field declarations alone and reports a missing
+# `database_url` argument at all ~29 of those call sites - a false
+# positive that would have been "fixed" by ignoring `call-arg`
+# everywhere, which would also have hidden the real ones.
+plugins = ["pydantic.mypy"]
+# Names the module in every diagnostic, which matters because several
+# subsystems here have same-named modules (`registry.py`, `models.py`).
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+# Third-party packages that ship no type information (no `py.typed`).
+# Without this mypy reports one `import-untyped` error per import site,
+# which says nothing about this codebase's own correctness and drowns
+# the findings that do. Listed explicitly rather than
+# `ignore_missing_imports = true` globally, so a genuinely mistyped
+# import of a package that *does* ship stubs is still an error.
+module = [
+    "aioboto3.*",
+    "aioresponses.*",
+    "apscheduler.*",
+    "asyncpg.*",
+    "botocore.*",
+    "filetype.*",
+    "neo4j.*",
+    "pandas.*",
+    "plotly.*",
+    "pypdfium2.*",
+    "pytesseract.*",
+    "sentence_transformers.*",
+    "unstructured.*",
+    "yaml.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The repository root holds a `docker/` directory of compose fixtures
+# (`prometheus.yml`, `init-test-db.sql`) with no Python in it at all.
+# Namespace-package resolution makes mypy read `import docker` in
+# `praxis/sandbox/executor.py` as *that* directory rather than the
+# installed docker-py SDK, and then report `DockerClient` and `from_env`
+# as missing attributes - three errors about a module that is fine.
+# Namespace packages cannot simply be switched off, because langgraph
+# and opentelemetry are both genuine namespace packages and stop
+# resolving without them; skipping this one module's own analysis is the
+# narrow fix.
+module = ["docker", "docker.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# `opentelemetry` is a namespace package split across two distributions
+# (`-api` provides `opentelemetry.metrics` and `.trace`, `-sdk` provides
+# `opentelemetry.sdk.*`). mypy resolves the namespace to one of them and
+# then reports `metrics` as a missing attribute of the package, which is
+# wrong: `from opentelemetry import metrics` succeeds at runtime, and
+# `praxis/observability/metrics.py` guards the import anyway and falls
+# back to no-op instruments when OTel is genuinely absent.
+module = ["opentelemetry", "opentelemetry.*"]
+follow_imports = "skip"
+ignore_missing_imports = true

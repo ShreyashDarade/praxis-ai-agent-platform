@@ -19,7 +19,8 @@ logic itself, e.g. `praxis.api.main`'s `record_health_scan`/
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from apscheduler.job import Job
 from apscheduler.schedulers.background import BackgroundScheduler

@@ -35,10 +35,7 @@ class TabularParser(Parser):
     @staticmethod
     def _summarize(data: bytes, mime_type: str) -> str:
         buffer = io.BytesIO(data)
-        if mime_type == "text/csv":
-            frame = pd.read_csv(buffer)
-        else:
-            frame = pd.read_excel(buffer)
+        frame = pd.read_csv(buffer) if mime_type == "text/csv" else pd.read_excel(buffer)
 
         # Blank lines separate the logical sections (shape / columns /
         # numeric summary) on purpose - TableAwareChunker splits on

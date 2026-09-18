@@ -19,8 +19,9 @@ through unchanged - only this exact `"$"`-prefixed shape is special.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 
 @dataclass
@@ -96,7 +97,9 @@ def _resolve_value(value: Any, results: dict[int, Any]) -> Any:
         return step_result
     if isinstance(step_result, dict) and output_key in step_result:
         return step_result[output_key]
-    raise KeyError(f"'{value}' references output '{output_key}', which step {index}'s result does not have")
+    raise KeyError(
+        f"'{value}' references output '{output_key}', which step {index}'s result does not have"
+    )
 
 
 StepExecutor = Callable[[int, PlanStep], Awaitable[Any]]
@@ -130,8 +133,10 @@ async def run_graph(steps: list[PlanStep], executor: StepExecutor) -> dict[int, 
             )
             for index in level
         }
-        outcomes = await asyncio.gather(*(executor(index, resolved_steps[index]) for index in level))
-        for index, outcome in zip(level, outcomes):
+        outcomes = await asyncio.gather(
+            *(executor(index, resolved_steps[index]) for index in level)
+        )
+        for index, outcome in zip(level, outcomes, strict=True):
             results[index] = outcome
 
     return results

@@ -62,7 +62,11 @@ import structlog
 
 from praxis.agents import skill as skill_module
 from praxis.agents import skill_registry
+from praxis.agents.manifest import compute_code_hash
+from praxis.agents.publication import SkillStatus
 from praxis.agents.skill import Skill
+from praxis.cache import scopes
+from praxis.cache.keys import CacheKey
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.connectors.retry import call_with_retry
 from praxis.core.exceptions import SynthesisValidationError
@@ -73,6 +77,7 @@ from praxis.memory.db import PostgresStore
 from praxis.memory.graph_store import PgGraphStore
 from praxis.memory.models import SkillRecord
 from praxis.observability.tracing import start_span
+from praxis.security.principal import Principal
 
 _logger = structlog.get_logger(__name__)
 
@@ -91,7 +96,9 @@ _DEFAULT_SANDBOX_TIMEOUT_SECONDS = 30
 # triggers back-to-back, short enough that a connector's schema
 # actually changing is noticed again well within a deployment's
 # lifetime, unlike the GraphStore record itself (durable, unbounded).
-_SCHEMA_CACHE_TTL_SECONDS = 300
+# Read from `praxis.cache.scopes` rather than restated here, so the TTL
+# and the reasoning for it stay in one place.
+_SCHEMA_CACHE_TTL_SECONDS = scopes.ttl_for(scopes.CONNECTOR_SCHEMA)
 
 # A full skill module + a self-test with several real assertions
 # routinely runs to 100+ lines combined; on a retry, the prompt also
@@ -152,7 +159,8 @@ def _stub_preamble() -> str:
         "exec(compile(_praxis_stub_skill_src, 'praxis/agents/skill.py', 'exec'), "
         "_praxis_stub_skill_mod.__dict__)\n"
         "_praxis_stub_sys.modules['praxis.agents.skill'] = _praxis_stub_skill_mod\n"
-        "_praxis_stub_registry_mod = _praxis_stub_types.ModuleType('praxis.agents.skill_registry')\n"
+        "_praxis_stub_registry_mod = _praxis_stub_types.ModuleType("
+        "'praxis.agents.skill_registry')\n"
         "exec(compile(_praxis_stub_registry_src, 'praxis/agents/skill_registry.py', 'exec'), "
         "_praxis_stub_registry_mod.__dict__)\n"
         "_praxis_stub_sys.modules['praxis.agents.skill_registry'] = _praxis_stub_registry_mod\n"
@@ -177,7 +185,8 @@ def _build_sandbox_script(module_code: str, self_test_code: str) -> str:
     lines = ["_praxis_sandbox_ns = {'__name__': '__main__'}"]
     for position, segment in enumerate(segments):
         lines.append(
-            f"exec(compile({segment!r}, 'synthesis_segment_{position}', 'exec'), _praxis_sandbox_ns)"
+            f"exec(compile({segment!r}, 'synthesis_segment_{position}', 'exec'), "
+            "_praxis_sandbox_ns)"
         )
     return "\n".join(lines)
 
@@ -297,6 +306,23 @@ def _connector_access_hint(connector: Connector) -> str | None:
     )
 
 
+def _approval_required_by_settings() -> bool:
+    """Whether synthesized skills need approval before they may run.
+
+    Reads `Settings` lazily (constructing it at import time would make
+    importing this module fail on an unconfigured environment) and
+    fails **closed**: if configuration cannot be read at all, approval
+    is required. An unreadable config must never be the reason
+    unreviewed generated code becomes executable.
+    """
+    try:
+        from praxis.config import Settings as _Settings
+
+        return bool(_Settings().require_skill_approval)
+    except Exception:  # noqa: BLE001 - see docstring
+        return True
+
+
 class CapabilityFactory:
     """Synthesizes, sandbox-validates, and registers new `Skill`s (spec §3/§7)."""
 
@@ -311,7 +337,8 @@ class CapabilityFactory:
         *,
         sandbox_timeout_seconds: int = _DEFAULT_SANDBOX_TIMEOUT_SECONDS,
         schema_cache: Cache | None = None,
-        schema_cache_ttl_seconds: int = _SCHEMA_CACHE_TTL_SECONDS,
+        schema_cache_ttl_seconds: int | None = _SCHEMA_CACHE_TTL_SECONDS,
+        require_approval: bool | None = None,
     ) -> None:
         self._catalogue = catalogue
         self._prompt_manager = prompt_manager
@@ -322,6 +349,11 @@ class CapabilityFactory:
         self._sandbox_timeout_seconds = sandbox_timeout_seconds
         self._schema_cache: Cache = schema_cache if schema_cache is not None else InMemoryCache()
         self._schema_cache_ttl_seconds = schema_cache_ttl_seconds
+        self._require_approval = (
+            require_approval
+            if require_approval is not None
+            else _approval_required_by_settings()
+        )
 
     async def synthesize(
         self,
@@ -329,8 +361,26 @@ class CapabilityFactory:
         *,
         connector: Connector | None = None,
         task_id: str | None = None,
+        principal: Principal | None = None,
     ) -> Skill:
-        with start_span("capability_factory.synthesize", task_id=task_id or "", connector=connector.name if connector else ""):
+        """`principal`, when supplied, scopes the connector-schema cache
+        to that principal's tenant and effective permission set.
+
+        It is optional and defaults to `None` so every existing caller
+        is unchanged. What it buys when present: an introspected schema
+        is a description of a tenant's own data source, and two tenants
+        that happen to register a connector with the same name and DSN
+        would otherwise share one cache entry (see
+        `_connector_identity`, which already had to learn this lesson
+        once for DSNs). It also keeps a principal whose permissions do
+        not let it read a connector from being handed a schema a
+        broader principal warmed the cache with.
+        """
+        with start_span(
+            "capability_factory.synthesize",
+            task_id=task_id or "",
+            connector=connector.name if connector else "",
+        ):
             _logger.info(
                 "synthesis_started", need_description=need_description, task_id=task_id,
                 connector=connector.name if connector else None,
@@ -338,10 +388,12 @@ class CapabilityFactory:
             connector_schema: dict[str, Any] | None = None
             connector_access_hint: str | None = None
             if connector is not None:
-                connector_schema = await self._connector_schema(connector)
+                connector_schema = await self._connector_schema(connector, principal=principal)
                 connector_access_hint = _connector_access_hint(connector)
             connector_schema_text = (
-                json.dumps(connector_schema, indent=2, default=str) if connector_schema is not None else None
+                json.dumps(connector_schema, indent=2, default=str)
+                if connector_schema is not None
+                else None
             )
 
             previous_code: str | None = None
@@ -365,8 +417,14 @@ class CapabilityFactory:
                     previous_self_test=previous_self_test,
                     error_detail=error_detail,
                 )
+                # The synthesis prompt embeds the tenant's own
+                # introspected schema, so its cached completion is
+                # tenant data too and is keyed accordingly.
                 response = await self._catalogue.complete(
-                    _LLM_PURPOSE, prompt, max_tokens=_MAX_RESPONSE_TOKENS
+                    _LLM_PURPOSE,
+                    prompt,
+                    max_tokens=_MAX_RESPONSE_TOKENS,
+                    principal=principal,
                 )
 
                 try:
@@ -382,7 +440,9 @@ class CapabilityFactory:
                     continue
 
                 script = _build_sandbox_script(module_code, self_test_code)
-                result = await self._sandbox.run(script, timeout_seconds=self._sandbox_timeout_seconds)
+                result = await self._sandbox.run(
+                    script, timeout_seconds=self._sandbox_timeout_seconds
+                )
 
                 if result.exit_code == 0 and _SUCCESS_MARKER in result.stdout:
                     _logger.info(
@@ -396,7 +456,9 @@ class CapabilityFactory:
                     f"attempt {attempt}/{_MAX_ATTEMPTS}: sandbox exit_code={result.exit_code}\n"
                     f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
                 )
-                previous_code, previous_self_test, error_detail = module_code, self_test_code, last_detail
+                previous_code = module_code
+                previous_self_test = self_test_code
+                error_detail = last_detail
                 _logger.warning(
                     "synthesis_attempt_failed", attempt=attempt, max_attempts=_MAX_ATTEMPTS,
                     reason="sandbox_validation_failed", exit_code=result.exit_code,
@@ -453,18 +515,27 @@ class CapabilityFactory:
             return f"{connector.name}:{dsn_digest}"
         return connector.name
 
-    async def _connector_schema(self, connector: Connector) -> dict[str, Any]:
+    async def _connector_schema(
+        self, connector: Connector, *, principal: Principal | None = None
+    ) -> dict[str, Any]:
         identity = self._connector_identity(connector)
-        cache_key = f"connector_schema:{identity}"
+        # The key composes the connector identity (name + DSN digest)
+        # with the caller's tenant and effective permissions when there
+        # is one; with no principal it is the same untenanted keyspace
+        # every pre-tenancy caller already used.
+        cache_key = CacheKey.build(scopes.CONNECTOR_SCHEMA, principal, identity=identity)
 
-        cached = await self._schema_cache.get(cache_key)
+        cached = await self._schema_cache.get(cache_key.value)
         if cached is not None:
+            cache_key.authorize(principal)
             return cached
 
         graph_hit = await self._graph_store.neighbors(identity, relation=_DESCRIBES_RELATION)
         if graph_hit:
             schema = graph_hit[0]["metadata"]["schema"]
-            await self._schema_cache.set(cache_key, schema, ttl_seconds=self._schema_cache_ttl_seconds)
+            await self._schema_cache.set(
+                cache_key.value, schema, ttl_seconds=self._schema_cache_ttl_seconds
+            )
             return schema
 
         with start_span("connector.call", connector=connector.name, operation="describe"):
@@ -481,7 +552,7 @@ class CapabilityFactory:
             metadata={"kind": description.kind, "schema": description.schema},
         )
         await self._schema_cache.set(
-            cache_key, description.schema, ttl_seconds=self._schema_cache_ttl_seconds
+            cache_key.value, description.schema, ttl_seconds=self._schema_cache_ttl_seconds
         )
         return description.schema
 
@@ -508,17 +579,49 @@ class CapabilityFactory:
 
         registered_skill = skill_registry.get_skill(skill_name)
 
+        # Phase 21 (Prompt §7: "require approval before
+        # publishing/enabling it"). The catalogue row's status decides
+        # whether this skill may actually be *invoked*:
+        #
+        #   pending_approval -> sandbox-validated, recorded, and
+        #                       visible in the approval queue, but the
+        #                       Orchestrator refuses to run it;
+        #   active           -> a human with `skill:approve` has
+        #                       signed off on this exact code hash.
+        #
+        # The gate defaults ON, because "generated code is trusted
+        # unless someone remembers to switch on review" is exactly the
+        # posture the brief forbids. A deployment that genuinely wants
+        # autonomous activation sets `PRAXIS_REQUIRE_SKILL_APPROVAL=false`
+        # deliberately, and that choice is then visible in its config
+        # rather than implicit in the code.
+        status = (
+            SkillStatus.PENDING_APPROVAL.value
+            if self._require_approval
+            else SkillStatus.ACTIVE.value
+        )
         async with self._store.session() as session:
             session.add(
                 SkillRecord(
                     name=skill_name,
                     risk=registered_skill.risk,
                     synthesized=True,
+                    status=status,
                     inputs_schema=dict(registered_skill.inputs),
                     outputs_schema=dict(registered_skill.outputs),
+                    code_hash=compute_code_hash(module_code),
+                    source_path=str(file_path),
+                    description=(registered_skill.__doc__ or "").strip().split("\n")[0],
                 )
             )
             await session.commit()
+
+        if self._require_approval:
+            _logger.info(
+                "synthesized_skill_pending_approval",
+                skill=skill_name,
+                code_hash=compute_code_hash(module_code),
+            )
 
         # Lineage graph (spec §9): every synthesized skill is a node
         # linked to the task that needed it and the connector schema it

@@ -50,7 +50,9 @@ _LLM_PURPOSE = "diagnosis"
 # `praxis.ingestion.enrichment.document_enrichment`'s summary/topics
 # parse - real model output routinely varies casing/whitespace despite
 # an explicit requested format.
-_DIAGNOSIS_RE = re.compile(r"diagnosis\s*:\s*(.*?)(?=remediation\s*:|\Z)", re.IGNORECASE | re.DOTALL)
+_DIAGNOSIS_RE = re.compile(
+    r"diagnosis\s*:\s*(.*?)(?=remediation\s*:|\Z)", re.IGNORECASE | re.DOTALL
+)
 _REMEDIATION_RE = re.compile(r"remediation\s*:\s*(.*)", re.IGNORECASE | re.DOTALL)
 
 

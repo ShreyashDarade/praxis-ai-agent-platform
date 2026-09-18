@@ -11,7 +11,7 @@ tenant/user context rather than LLM-supplied identity").
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from praxis.memory.models import DEFAULT_TENANT_ID
 
@@ -41,7 +41,7 @@ class Principal:
     api_key_id: str | None = None
     is_system: bool = False
 
-    def with_scopes(self, scopes: tuple[str, ...] | None) -> "Principal":
+    def with_scopes(self, scopes: tuple[str, ...] | None) -> Principal:
         """Returns a copy carrying `scopes` - used when a request's API
         key narrows what that call may do."""
         return Principal(

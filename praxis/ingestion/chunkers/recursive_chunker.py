@@ -19,7 +19,11 @@ _DEFAULT_CHUNK_OVERLAP = 200
 class RecursiveChunker(Chunker):
     """Splits prose recursively (paragraph -> sentence -> word) to stay under `chunk_size`."""
 
-    def __init__(self, chunk_size: int = _DEFAULT_CHUNK_SIZE, chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP) -> None:
+    def __init__(
+        self,
+        chunk_size: int = _DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
+    ) -> None:
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size, chunk_overlap=chunk_overlap
         )

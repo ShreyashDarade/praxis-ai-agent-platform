@@ -27,10 +27,12 @@ next, not speculative code guessing at a call site that doesn't exist.
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 import structlog
 
+from praxis.connectors.errors import describe_exception
 from praxis.core.exceptions import ConnectorError
 
 T = TypeVar("T")
@@ -77,13 +79,14 @@ async def call_with_retry(
                 operation=operation,
                 attempt=attempt,
                 max_attempts=max_attempts,
-                error=str(exc),
+                error=describe_exception(exc),
             )
             if attempt < max_attempts and retry_delay_seconds > 0:
                 await asyncio.sleep(retry_delay_seconds)
 
     raise ConnectorError(
-        f"connector '{connector_name}' operation '{operation}' failed after {max_attempts} attempt(s)",
+        f"connector '{connector_name}' operation '{operation}' failed after "
+        f"{max_attempts} attempt(s)",
         connector_name=connector_name,
         operation=operation,
         attempts=max_attempts,

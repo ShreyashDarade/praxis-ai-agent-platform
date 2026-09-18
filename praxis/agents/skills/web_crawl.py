@@ -50,7 +50,9 @@ class WebCrawlSkill(Skill):
             crawl_kwargs["max_depth"] = kwargs["max_depth"]
 
         connector = WebConnector()
-        content = await connector.crawl(start_url, question=question, known_urls=known_urls, **crawl_kwargs)
+        content = await connector.crawl(
+            start_url, question=question, known_urls=known_urls, **crawl_kwargs
+        )
         return {"content": content}
 
 

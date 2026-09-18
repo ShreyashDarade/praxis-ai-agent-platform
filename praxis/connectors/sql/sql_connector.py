@@ -33,6 +33,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection as SyncConnection
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from praxis.connectors.errors import describe_exception
 from praxis.core.interfaces import Connector, ConnectorDescription, HealthStatus
 from praxis.safety.sql_guard import QueryCostLimits, SqlGuard
 
@@ -202,7 +203,7 @@ class SQLConnector(Connector):
                 await engine.dispose()
             return HealthStatus(name=self.name, healthy=True)
         except Exception as exc:  # noqa: BLE001 - a health check must never raise
-            return HealthStatus(name=self.name, healthy=False, detail=str(exc))
+            return HealthStatus(name=self.name, healthy=False, detail=describe_exception(exc))
 
 
 def _introspect(sync_conn: SyncConnection) -> dict[str, Any]:

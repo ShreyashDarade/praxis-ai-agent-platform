@@ -12,7 +12,7 @@ what a credential-revocation control is for.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
@@ -48,7 +48,7 @@ async def authenticate_api_key(store: PostgresStore, plaintext: str | None) -> P
         raise AuthenticationError("malformed API key", reason="malformed")
 
     key_hash = hash_api_key(plaintext)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     async with store.session() as session:
         record = (
@@ -61,7 +61,7 @@ async def authenticate_api_key(store: PostgresStore, plaintext: str | None) -> P
         if record.expires_at is not None:
             expires_at = record.expires_at
             if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
+                expires_at = expires_at.replace(tzinfo=UTC)
             if expires_at <= now:
                 raise AuthenticationError("API key has expired", reason="expired")
 

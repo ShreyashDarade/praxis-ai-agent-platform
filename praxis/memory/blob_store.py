@@ -11,7 +11,7 @@ anything against a different backend.
 """
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from praxis.core.interfaces import BlobStore
 
@@ -45,6 +45,36 @@ def is_key_in_tenant(key: str, tenant_id: str) -> bool:
     return key.startswith(f"{_TENANT_KEY_PREFIX}/{tenant_id}/")
 
 
+def validate_blob_key(key: str) -> None:
+    """Rejects any key no `BlobStore` backend may accept; raises
+    `ValueError` with the reason.
+
+    Shared by every backend rather than reimplemented per backend, and
+    for a specific reason: a key must be accepted or refused
+    *identically* whichever store is configured, or swapping
+    `LocalBlobStore` for `S3BlobStore` silently changes which uploads
+    succeed. Keys come from user-supplied filenames (spec §5 step 1), so
+    this is a security boundary on the local backend - `..` escapes the
+    scratch root - and a namespacing boundary on the remote ones, where
+    an S3 key is literal but a prefix is not a container: `t/a/../b`
+    stored verbatim escapes `t/a/`'s notional namespace the moment
+    anything normalizes it, including several S3-compatible gateways.
+
+    Checks both POSIX and Windows separators. The local backend runs on
+    whatever the deployment's OS is, so treating `a\\..\\b` as one
+    opaque segment (which a pure-POSIX split does) would leave a real
+    traversal open on Windows.
+    """
+    if not key:
+        raise ValueError("invalid blob key (must not be empty)")
+
+    normalized = key.replace("\\", "/")
+    if normalized.startswith("/") or PureWindowsPath(key).is_absolute():
+        raise ValueError(f"invalid blob key (must be a relative path): {key!r}")
+    if ".." in normalized.split("/"):
+        raise ValueError(f"invalid blob key (must not contain '..'): {key!r}")
+
+
 class LocalBlobStore(BlobStore):
     """Stores blobs as files under `root`, keyed by a caller-supplied relative key."""
 
@@ -57,12 +87,13 @@ class LocalBlobStore(BlobStore):
         # user-supplied filename in a real deployment (spec §5 step 1's
         # upload path), so it must never be allowed to escape `root` via
         # ".." segments or be treated as an absolute path in its own
-        # right.
-        candidate = Path(key)
-        if candidate.is_absolute() or ".." in candidate.parts:
-            raise ValueError(f"invalid blob key (must be a relative path with no '..'): {key!r}")
+        # right. The key-shape half of that check is shared with every
+        # other backend (`validate_blob_key`); the resolved-path half
+        # below is specific to a filesystem and catches what a symlink
+        # under `root` could still reach.
+        validate_blob_key(key)
 
-        resolved = (self._root / candidate).resolve()
+        resolved = (self._root / Path(key)).resolve()
         if resolved != self._root and self._root not in resolved.parents:
             raise ValueError(f"invalid blob key (escapes blob store root): {key!r}")
         return resolved

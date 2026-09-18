@@ -21,8 +21,8 @@ a `register_connector_factory(...)` call); nothing else changes.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from praxis.config import Settings
 from praxis.core.interfaces import Connector
@@ -55,3 +55,23 @@ def register_connector_factory(factory: ConnectorFactory) -> None:
 
 def all_factories() -> list[ConnectorFactory]:
     return list(_FACTORIES)
+
+
+def required(value: str | None, *, setting: str) -> str:
+    """Narrows a `Settings` field a factory's own `is_configured` has
+    already established is present.
+
+    Every connector's `build` reads optional settings, and it only ever
+    runs after `build_registry` has asked its `is_configured`. That
+    invariant is split across two separate lambdas, so nothing checks
+    that the pair agree - and when they disagree the `None` travels all
+    the way into a connector and surfaces as an unauthenticated 401 or a
+    connection to the string "None". This turns that into one message
+    naming the setting, at the point of construction.
+    """
+    if not value:
+        raise ValueError(
+            f"connector factory reported '{setting}' as configured, but it is unset; "
+            "the factory's is_configured and build disagree"
+        )
+    return value

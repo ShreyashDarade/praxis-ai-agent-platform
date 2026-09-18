@@ -89,9 +89,7 @@ def _grains_compatible(layer: SemanticLayer, metric_entity: str, dim_entity: str
     if metric_entity == dim_entity:
         return True
     entity = layer.entity(metric_entity)
-    if entity is not None and dim_entity in entity.rolls_up_to:
-        return True
-    return False
+    return entity is not None and dim_entity in entity.rolls_up_to
 
 
 def _check_grain(

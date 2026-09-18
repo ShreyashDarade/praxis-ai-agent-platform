@@ -35,14 +35,16 @@ to grow a lifecycle it doesn't need.
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult, ContentBlock
 
+from praxis.connectors.errors import describe_exception
 from praxis.core.interfaces import Connector, ConnectorDescription, HealthStatus
 
 
@@ -87,16 +89,20 @@ class MCPConnector(Connector):
         """
         if self._command is not None:
             params = StdioServerParameters(command=self._command, args=self._args)
-            async with stdio_client(params) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    yield session
+            async with (
+                stdio_client(params) as (read_stream, write_stream),
+                ClientSession(read_stream, write_stream) as session,
+            ):
+                await session.initialize()
+                yield session
         else:
             assert self._url is not None  # guaranteed by __init__'s validation
-            async with streamable_http_client(self._url) as (read_stream, write_stream, _):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    yield session
+            async with (
+                streamable_http_client(self._url) as (read_stream, write_stream, _),
+                ClientSession(read_stream, write_stream) as session,
+            ):
+                await session.initialize()
+                yield session
 
     async def describe(self) -> ConnectorDescription:
         async with self._session() as session:
@@ -127,7 +133,7 @@ class MCPConnector(Connector):
                 await session.list_tools()
             return HealthStatus(name=self.name, healthy=True)
         except Exception as exc:  # noqa: BLE001 - a health check must never raise
-            return HealthStatus(name=self.name, healthy=False, detail=str(exc))
+            return HealthStatus(name=self.name, healthy=False, detail=describe_exception(exc))
 
 
 def _unwrap(result: CallToolResult) -> Any:

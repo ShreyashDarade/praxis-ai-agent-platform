@@ -15,7 +15,7 @@ real row, including on a database created by `Base.metadata.create_all`
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
@@ -127,7 +127,7 @@ async def issue_api_key(
             key_hash=key_hash,
             scopes=scopes,
             expires_at=(
-                datetime.now(timezone.utc) + timedelta(days=expires_in_days)
+                datetime.now(UTC) + timedelta(days=expires_in_days)
                 if expires_in_days is not None
                 else None
             ),
@@ -147,6 +147,6 @@ async def revoke_api_key(store: PostgresStore, *, key_id: str) -> ApiKey:
         record = await session.get(ApiKey, key_id)
         if record is None:
             raise ValueError(f"no api key with id '{key_id}'")
-        record.revoked_at = datetime.now(timezone.utc)
+        record.revoked_at = datetime.now(UTC)
         await session.commit()
         return record

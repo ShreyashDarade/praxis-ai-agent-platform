@@ -16,10 +16,10 @@ attributes tests reach into directly.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import AsyncIterator, Awaitable, Callable
 
 import structlog
 from docker.errors import DockerException
@@ -30,6 +30,7 @@ from praxis.agents import skill_registry
 from praxis.agents.capability_factory import CapabilityFactory
 from praxis.agents.planner import Planner
 from praxis.agents.scheduler import Scheduler
+from praxis.agents.subagent import discover_agents
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
 from praxis.connectors.registry import ConnectorRegistry
@@ -72,6 +73,11 @@ parser_registry.discover_parsers()
 # `register_skill(...)` call is how a new skill gets added, not an edit
 # here.
 skill_registry.discover_skills()
+
+# Same discovery pattern for specialist sub-agents (Phase 15): one new
+# file in `praxis/agents/specialists/` with a `register_agent(...)`
+# call is how a specialist is added, with no edit here.
+discover_agents()
 
 # Loading the sentence-transformers model is expensive (first use may
 # download weights) - force it to load once here, at module level,
@@ -194,7 +200,9 @@ async def record_health_scan() -> list[HealthStatus]:
         async with store.session() as session:
             for result in results:
                 session.add(
-                    HealthRecord(component=result.name, healthy=result.healthy, detail=result.detail)
+                    HealthRecord(
+                        component=result.name, healthy=result.healthy, detail=result.detail
+                    )
                 )
             await session.commit()
     finally:
@@ -220,7 +228,7 @@ async def sweep_stale_approvals() -> list[str]:
     """
     settings = Settings()
     store = PostgresStore(settings)
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=settings.approval_timeout_seconds)
+    cutoff = datetime.now(UTC) - timedelta(seconds=settings.approval_timeout_seconds)
     swept: list[str] = []
     try:
         async with store.session() as session:
@@ -231,7 +239,7 @@ async def sweep_stale_approvals() -> list[str]:
             stale_tasks = (await session.execute(stmt)).scalars().all()
 
             for task in stale_tasks:
-                waited_seconds = (datetime.now(timezone.utc) - task.updated_at).total_seconds()
+                waited_seconds = (datetime.now(UTC) - task.updated_at).total_seconds()
                 error = ApprovalTimeoutError(
                     f"task '{task.id}' was left '{task.status}' past the "
                     f"{settings.approval_timeout_seconds}s approval timeout",
@@ -290,7 +298,9 @@ def _build_scheduler() -> Scheduler | None:
         _health_scan_job, settings.health_scan_interval_seconds, job_id="health_scan"
     )
     scheduler.add_interval_job(
-        _approval_timeout_sweep_job, settings.approval_timeout_seconds, job_id="approval_timeout_sweep"
+        _approval_timeout_sweep_job,
+        settings.approval_timeout_seconds,
+        job_id="approval_timeout_sweep",
     )
     scheduler.start()
     return scheduler
@@ -369,12 +379,21 @@ def _get_orchestrator() -> Orchestrator:
 # order of these two statements relative to each other doesn't matter -
 # but living here, at the bottom, keeps this file reading top-to-bottom
 # as "build the shared wiring, then mount the routes on top of it".
-from praxis.api.routes import admin, attachments, health, tasks  # noqa: E402
+from praxis.api.routes import (  # noqa: E402
+    admin,
+    attachments,
+    dashboards,
+    health,
+    schedules,
+    tasks,
+)
 
 app.include_router(health.router)
 app.include_router(attachments.router)
 app.include_router(tasks.router)
 app.include_router(admin.router)
+app.include_router(dashboards.router)
+app.include_router(schedules.router)
 
 
 async def _bootstrap_default_tenant() -> None:

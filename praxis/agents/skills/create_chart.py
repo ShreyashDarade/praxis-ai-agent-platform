@@ -32,7 +32,7 @@ from typing import Any
 
 from praxis.agents.skill import Skill
 from praxis.agents.skill_registry import register_skill
-from praxis.analytics.visualize import SUPPORTED_CHART_TYPES, PlotlyVisualizer
+from praxis.analytics.visualize import PlotlyVisualizer
 from praxis.config import Settings
 from praxis.memory.blob_store import LocalBlobStore, tenant_artifact_key
 from praxis.memory.models import DEFAULT_TENANT_ID
@@ -49,14 +49,24 @@ _EXTENSION_BY_MIME_TYPE = {"image/png": "png", "text/html": "html"}
 class CreateChartSkill(Skill):
     name = "create_chart"
     risk = "read_only"
-    inputs = {
-        "data": "list of row dicts to chart",
-        # Derived from the visualizer rather than spelled out, so the
-        # description the Planner reads cannot drift out of step with
-        # what `render()` will actually accept.
-        "chart_type": "|".join(SUPPORTED_CHART_TYPES),
-        "encoding": "dict mapping chart roles to column names",
-    }
+
+    @property
+    def inputs(self) -> dict[str, str]:  # type: ignore[override]
+        """Built per access, not frozen at class-creation time.
+
+        The Planner reads this to learn which `chart_type` values are
+        legal. A class-level dict would capture the chart types that
+        existed when this module was first imported, so a type added
+        later by `register_chart_type` would be drawable by `render()`
+        but invisible to the Planner - the exact drift this is derived
+        from the visualizer to avoid.
+        """
+        return {
+            "data": "list of row dicts to chart",
+            "chart_type": "|".join(PlotlyVisualizer.supported_chart_types()),
+            "encoding": "dict mapping chart roles to column names",
+        }
+
     outputs = {
         "artifact_key": "blob store key where the rendered chart is stored",
         "mime_type": "MIME type of the stored chart artifact",

@@ -29,6 +29,7 @@ status forever).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any, Protocol
 
 
@@ -78,19 +79,18 @@ class TaskEventBus:
         subscribers = self._subscribers.get(task_id)
         if not subscribers:
             return
-        try:
+        with contextlib.suppress(ValueError):
             subscribers.remove(queue)
-        except ValueError:
-            pass
         if not subscribers:
             self._subscribers.pop(task_id, None)
 
     async def publish(self, task_id: str, event: dict[str, Any]) -> None:
         for queue in list(self._subscribers.get(task_id, ())):
-            try:
+            # A full queue drops this event for that one slow subscriber
+            # rather than raising into the publisher - see the module
+            # docstring for why that trade is the right one here.
+            with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(event)
-            except asyncio.QueueFull:  # noqa: PERF203 - see module docstring
-                pass
 
 
 # The process-global bus `Orchestrator` publishes to by default (see its

@@ -84,7 +84,7 @@ _MODE_DESCRIPTIONS: dict[ExecutionMode, str] = {
 }
 
 
-def visible_skills(skills: list["Skill"], mode: ExecutionMode) -> list["Skill"]:
+def visible_skills(skills: list[Skill], mode: ExecutionMode) -> list[Skill]:
     """The skill set the Planner is allowed to see under `mode`.
 
     Under any mode that cannot actually mutate, mutating skills are

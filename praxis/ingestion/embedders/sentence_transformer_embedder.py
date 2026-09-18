@@ -82,7 +82,9 @@ class SentenceTransformerEmbedder(Embedder):
             for position, index in enumerate(missing_indices):
                 vector = vectors[position].tolist()
                 results[index] = vector
-                await self._cache.set(cache_keys[index], vector, ttl_seconds=self._cache_ttl_seconds)
+                await self._cache.set(
+                    cache_keys[index], vector, ttl_seconds=self._cache_ttl_seconds
+                )
 
         return results  # type: ignore[return-value]  # every entry is filled by this point
 

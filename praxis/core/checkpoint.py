@@ -31,9 +31,11 @@ and tasks belong to tenants.
 """
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Sequence
+from typing import Any
 
 import structlog
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
     ChannelVersions,
@@ -66,7 +68,7 @@ class PraxisCheckpointSaver(BaseCheckpointSaver):
         self._store = store
         self._tenant_id = tenant_id
 
-    def for_tenant(self, tenant_id: str) -> "PraxisCheckpointSaver":
+    def for_tenant(self, tenant_id: str) -> PraxisCheckpointSaver:
         """A saver scoped to one tenant.
 
         Cheap to construct and shares the connection pool, so the
@@ -80,7 +82,7 @@ class PraxisCheckpointSaver(BaseCheckpointSaver):
     # Reads
     # ---------------------------------------------------------------- #
 
-    async def aget_tuple(self, config: dict[str, Any]) -> CheckpointTuple | None:
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         checkpoint_id = get_checkpoint_id(config)
@@ -121,7 +123,7 @@ class PraxisCheckpointSaver(BaseCheckpointSaver):
     ) -> CheckpointTuple:
         checkpoint = self.serde.loads_typed((row.checkpoint_type, row.checkpoint))
         metadata = self.serde.loads_typed((row.metadata_type, row.checkpoint_metadata))
-        parent_config = (
+        parent_config: RunnableConfig | None = (
             {
                 "configurable": {
                     "thread_id": row.thread_id,
@@ -155,10 +157,10 @@ class PraxisCheckpointSaver(BaseCheckpointSaver):
 
     async def alist(
         self,
-        config: dict[str, Any] | None,
+        config: RunnableConfig | None,
         *,
         filter: dict[str, Any] | None = None,
-        before: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
         limit: int | None = None,
     ) -> AsyncIterator[CheckpointTuple]:
         """Lists checkpoints newest-first - what powers time-travel
@@ -210,11 +212,11 @@ class PraxisCheckpointSaver(BaseCheckpointSaver):
 
     async def aput(
         self,
-        config: dict[str, Any],
+        config: RunnableConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
-    ) -> dict[str, Any]:
+    ) -> RunnableConfig:
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         parent_id = config["configurable"].get("checkpoint_id")
@@ -266,7 +268,7 @@ class PraxisCheckpointSaver(BaseCheckpointSaver):
 
     async def aput_writes(
         self,
-        config: dict[str, Any],
+        config: RunnableConfig,
         writes: Sequence[tuple[str, Any]],
         task_id: str,
         task_path: str = "",
@@ -331,12 +333,12 @@ class PraxisCheckpointSaver(BaseCheckpointSaver):
     # Sync surface - deliberately unavailable (see class docstring)
     # ---------------------------------------------------------------- #
 
-    def get_tuple(self, config: dict[str, Any]) -> CheckpointTuple | None:
+    def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         raise NotImplementedError(
             "PraxisCheckpointSaver is async-only; drive the graph with ainvoke/astream"
         )
 
-    def put(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    def put(self, *args: Any, **kwargs: Any) -> RunnableConfig:
         raise NotImplementedError(
             "PraxisCheckpointSaver is async-only; drive the graph with ainvoke/astream"
         )

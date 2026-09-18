@@ -121,7 +121,7 @@ class _BoundedTreeBuilder(ET.TreeBuilder):
         self._elements = 0
         self._characters = 0
 
-    def start(self, tag, attrs):  # type: ignore[override]
+    def start(self, tag, attrs):
         self._elements += 1
         self._depth += 1
         if self._elements > MAX_ELEMENTS:
@@ -136,11 +136,11 @@ class _BoundedTreeBuilder(ET.TreeBuilder):
             )
         return super().start(tag, attrs)
 
-    def end(self, tag):  # type: ignore[override]
+    def end(self, tag):
         self._depth -= 1
         return super().end(tag)
 
-    def data(self, data):  # type: ignore[override]
+    def data(self, data):
         self._characters += len(data)
         if self._characters > MAX_TEXT_CHARS:
             raise XmlSafetyError(

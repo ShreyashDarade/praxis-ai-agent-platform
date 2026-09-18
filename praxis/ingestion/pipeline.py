@@ -1,5 +1,6 @@
 # praxis/ingestion/pipeline.py
-"""Ingestion & RAG orchestration (spec §5): upload -> parse -> chunk -> enrich -> embed -> index -> retrieve.
+"""Ingestion & RAG orchestration, spec §5's lifecycle:
+upload -> parse -> chunk -> enrich -> embed -> index -> retrieve.
 
 Step 4 (Enrich) now runs between parse and chunk, per the spec's
 lifecycle ordering, via an optional `DocumentEnrichment` (Phase 4's LLM
@@ -49,7 +50,7 @@ class IngestResult(str):
 
     def __new__(
         cls, attachment_id: str, summary: str | None = None, topics: list[str] | None = None
-    ) -> "IngestResult":
+    ) -> IngestResult:
         obj = super().__new__(cls, attachment_id)
         obj.summary = summary
         obj.topics = topics
@@ -179,7 +180,9 @@ async def ingest(
 
         if chunks:
             embeddings = await embedder.embed(chunks)
-            for chunk_index, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
+            for chunk_index, (chunk_text, embedding) in enumerate(
+                zip(chunks, embeddings, strict=True)
+            ):
                 doc_id = f"{attachment_id}:{chunk_index}"
                 metadata: dict[str, Any] = {
                     "source": source,
@@ -204,7 +207,11 @@ async def ingest(
         raise
 
     if enrichment_result is not None:
-        return IngestResult(attachment_id, summary=enrichment_result.summary, topics=enrichment_result.topics)
+        return IngestResult(
+            attachment_id,
+            summary=enrichment_result.summary,
+            topics=enrichment_result.topics,
+        )
     return IngestResult(attachment_id)
 
 

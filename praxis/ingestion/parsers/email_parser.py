@@ -71,7 +71,9 @@ class EmailParser(Parser):
         sections = []
 
         header_lines = [
-            f"{name}: {str(message[name]).strip()}" for name in _HEADERS if message[name] is not None
+            f"{name}: {str(message[name]).strip()}"
+            for name in _HEADERS
+            if message[name] is not None
         ]
         if header_lines:
             sections.append("\n".join(header_lines))

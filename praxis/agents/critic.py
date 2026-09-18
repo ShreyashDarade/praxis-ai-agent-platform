@@ -29,8 +29,9 @@ unreliable, which is the most valuable thing this produces.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import structlog
 
@@ -103,7 +104,9 @@ def _check_has_evidence(result: SpecialistResult, _c: AcceptanceCriterion) -> tu
     return bool(result.evidence), "" if result.evidence else "no evidence was attached"
 
 
-def _check_output_keys(result: SpecialistResult, criterion: AcceptanceCriterion) -> tuple[bool, str]:
+def _check_output_keys(
+    result: SpecialistResult, criterion: AcceptanceCriterion
+) -> tuple[bool, str]:
     expected = criterion.expected or []
     missing = [key for key in expected if key not in result.results]
     return (not missing), f"missing result key(s): {missing}" if missing else ""
@@ -237,6 +240,12 @@ class Critic:
         the same context for all of them, and N calls would multiply
         cost for no additional signal.
         """
+        if self._prompt_manager is None or self._catalogue is None:
+            raise RuntimeError(
+                "model-based review requires both an LLM catalogue and a prompt manager; "
+                "review() is what guarantees they are configured before reaching here"
+            )
+
         prompt = self._prompt_manager.render(
             _REVIEW_PROMPT_NAME,
             _REVIEW_PROMPT_VERSION,

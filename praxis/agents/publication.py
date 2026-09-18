@@ -42,7 +42,7 @@ lacks.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -312,7 +312,7 @@ class SkillPublisher:
 
             record.status = SkillStatus.ACTIVE.value
             record.approved_by_user_id = approver.user_id
-            record.approved_at = datetime.now(timezone.utc)
+            record.approved_at = datetime.now(UTC)
             await session.commit()
 
         _logger.info(
@@ -351,7 +351,7 @@ class SkillPublisher:
                 )
             record.status = SkillStatus.REVOKED.value
             record.approved_by_user_id = approver.user_id
-            record.approved_at = datetime.now(timezone.utc)
+            record.approved_at = datetime.now(UTC)
             await session.commit()
 
         _logger.info("skill_rejected", skill=name, version=version, reason=reason)
