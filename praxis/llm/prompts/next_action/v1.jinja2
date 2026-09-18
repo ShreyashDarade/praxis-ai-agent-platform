@@ -34,14 +34,15 @@ Nothing has been tried yet; this is the first iteration.
 
 Decide the next action and respond with ONLY a JSON object - no markdown fences, no commentary:
 
-{"kind": "skill|delegate|finish", "target": "<tool or specialist name>", "args": {...}, "rationale": "<one sentence>"}
+{"kind": "skill|delegate|finish", "target": "<tool or specialist name>", "args": {...}, "hypothesis": "<what you expect this action to show, as a checkable claim>", "rationale": "<one sentence>"}
 
 Rules:
 - "skill": `target` is a tool name from the list above and `args` are that tool's declared inputs.
 - "delegate": `target` is a specialist name and `args` are that specialist's inputs.
-- "finish": use it as soon as the objective is answered. Put the answer in args as {"answer": "<the answer, stating the actual findings and the numbers they rest on>"}. `target` is "".
+- "finish": use it as soon as the objective is answered. `target` is "". Put the answer in args as {"answer": "<the answer, stating the actual findings and the numbers they rest on>", "evidence": [<iteration indices whose observations the answer rests on>]}. Every number or fact in the answer must appear in one of those cited observations. An answer that cites no iteration is a guess and will be treated as one.
 - Finish rather than padding. An objective that is already answered does not need another tool call.
 - But NEVER finish on the first iteration when the objective depends on data you have not fetched. With no observations yet you have no evidence, and an answer asserted from none is a guess however confident it sounds. Act first, then finish from what came back.
 - Also finish when the objective genuinely cannot be answered with the tools available. Say so plainly in the answer, and say what was tried and what blocked it - a truthful "I could not determine X because Y" is a correct outcome, and inventing a number to look finished is not.
+- Each action carries a hypothesis - a claim the observation will confirm or refute. When the history shows a hypothesis REFUTED, do not re-test it with the same action; when it shows one CONFIRMED, build on it rather than re-checking it.
 - Read every previous observation literally. A failure usually names the real problem - a column that does not exist, an argument that was wrong, a tool that is not authorized. Use that to choose different arguments, not the same ones again.
 - One action only. Do not return a list, and do not plan several steps ahead.

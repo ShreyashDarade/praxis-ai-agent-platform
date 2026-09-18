@@ -75,6 +75,12 @@ from praxis.agents.subagent import AgentContext, SubAgent
 _logger = structlog.get_logger(__name__)
 
 DEFAULT_MAX_ITERATIONS = 12
+
+# Argument key under which a policy attaches its hypothesis for an
+# action. Owned here rather than in `praxis.agents.policy` because the
+# loop is what must strip it before a tool sees it, and what must
+# ignore it when deciding whether two actions are the same.
+_HYPOTHESIS_KEY = "__hypothesis__"
 # How many identical (action, observation) pairs before the loop is
 # considered stalled. Two is too eager - a legitimate retry after a
 # transient failure repeats once. Three means it has genuinely
@@ -122,8 +128,14 @@ class Action:
         Includes the arguments: calling the same tool with *different*
         arguments is progress; calling it with the same ones is not.
         """
+        # The policy may attach a hypothesis under a reserved key (see
+        # `praxis.agents.policy`). It is prose about the action, not
+        # part of it, and must not make a re-worded repeat look like a
+        # different action - that would defeat stall detection exactly
+        # when it matters.
+        identity = {k: v for k, v in self.args.items() if k != _HYPOTHESIS_KEY}
         payload = json.dumps(
-            {"kind": self.kind.value, "target": self.target, "args": self.args},
+            {"kind": self.kind.value, "target": self.target, "args": identity},
             sort_keys=True,
             default=str,
         )
@@ -186,6 +198,9 @@ class LoopResult:
     stop_reason: StopReason
     iterations: list[Iteration] = field(default_factory=list)
     answer: Any = None
+    # Iteration indices the answer cites. Empty when the policy cited
+    # nothing - which the caller should read as "unsupported".
+    evidence: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     spend: dict[str, Any] = field(default_factory=dict)
     # LangGraph thread id, when a checkpointer was configured - the
@@ -207,6 +222,7 @@ class LoopResult:
             "iterations": [iteration.to_dict() for iteration in self.iterations],
             "iteration_count": self.iteration_count,
             "answer": self.answer,
+            "evidence": self.evidence,
             "errors": self.errors,
             "spend": self.spend,
             "thread_id": self.thread_id,
@@ -214,6 +230,8 @@ class LoopResult:
 
 
 class _LoopState(TypedDict, total=False):
+    # Iteration indices a FINISH action cited as the basis of its answer.
+    evidence: list[int]
     """The LangGraph state channel for one loop run.
 
     `iterations` and `errors` use `operator.add` reducers so each node
@@ -318,9 +336,15 @@ class AgentLoop:
             }
 
         if action.kind is ActionKind.FINISH:
+            # The citations travel with the answer. A policy that says
+            # which observations an answer rests on is only useful if
+            # the loop keeps that list rather than discarding every arg
+            # but `answer`, which is what happened before.
+            cited = action.args.get("evidence") or []
             return {
                 "stop_reason": StopReason.GOAL_REACHED.value,
                 "answer": action.args.get("answer"),
+                "evidence": [int(i) for i in cited if str(i).lstrip("-").isdigit()],
             }
 
         try:
@@ -414,7 +438,8 @@ class AgentLoop:
             return Observation(
                 succeeded=False, error=f"no skill named '{action.target}' is available"
             )
-        output = await skill.run(**action.args, tenant_id=contract.tenant_id)
+        tool_args = {k: v for k, v in action.args.items() if k != _HYPOTHESIS_KEY}
+        output = await skill.run(**tool_args, tenant_id=contract.tenant_id)
         return Observation(succeeded=True, content=output)
 
     async def _act_chain(self, action: Action, contract: TaskContract) -> Observation:
@@ -542,6 +567,7 @@ class AgentLoop:
             list(final.get("errors", [])),
             resolved_thread,
             answer=final.get("answer"),
+            evidence=list(final.get("evidence", [])),
         )
 
     def _resolve_stop_reason(self, final: _LoopState) -> StopReason:
@@ -560,6 +586,7 @@ class AgentLoop:
         thread_id: str,
         *,
         answer: Any = None,
+        evidence: list[int] | None = None,
     ) -> LoopResult:
         _logger.info(
             "agent_loop_finished",
@@ -572,6 +599,7 @@ class AgentLoop:
             iterations=iterations,
             errors=errors,
             answer=answer,
+            evidence=list(evidence or []),
             spend=self._budget.snapshot(),
             thread_id=thread_id if self._checkpointer is not None else None,
         )

@@ -28,6 +28,20 @@ and repeating it wastes an attempt. Neither is binding: the current
 intent wins wherever they disagree.
 {% endif %}
 
+{% if refuted_claims %}
+WHAT THIS TASK HAS ALREADY ESTABLISHED. Each line is a claim about one
+step, with the verdict the evidence gave it - not a guess:
+
+{{ refuted_claims }}
+
+A REFUTED step is a dead end as written: the same skill with the same
+arguments will fail the same way, and a plan that repeats one is
+rejected before it runs. A CONFIRMED step worked and may be reused
+as-is. An UNRESOLVED step never ran - it has not been tested and is
+not disproven, so it may still be the right approach once whatever
+blocked it is fixed.
+{% endif %}
+
 {% if prior_failures %}
 A PREVIOUS ATTEMPT AT THIS SAME INTENT FAILED. Here is exactly what was
 tried and what went wrong:

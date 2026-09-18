@@ -42,6 +42,8 @@ from praxis.core.dead_letter import DeadLetterQueue
 from praxis.core.exceptions import ApprovalTimeoutError
 from praxis.core.interfaces import HealthStatus
 from praxis.core.orchestrator import Orchestrator
+from praxis.core.completion import CompletionGate
+from praxis.agents.critic import Critic
 from praxis.ingestion.embedders.sentence_transformer_embedder import get_default_embedder
 from praxis.ingestion.parsers import registry as parser_registry
 from praxis.llm.catalogue import LLMCatalogue
@@ -463,8 +465,23 @@ def _get_orchestrator() -> Orchestrator:
             capability_factory,
             connector_registry=_connector_registry,
             graph_store=graph_store,
+            completion_gate=_completion_gate(),
         )
     return _orchestrator
+
+
+def _completion_gate() -> CompletionGate:
+    """The gate that decides whether a finished task answered its intent.
+
+    With `verify_completion` on, a reviewing `Critic` judges the result
+    against the intent through a real model; off, only the gate's
+    deterministic checks run. Built here rather than defaulted inside
+    the Orchestrator so the decision to spend a model call per task is
+    a deployment's, made once, and never a test double's.
+    """
+    if not Settings().verify_completion:
+        return CompletionGate()
+    return CompletionGate(Critic(LLMCatalogue(), PromptManager()))
 
 
 _conversation_service: ConversationService | None = None

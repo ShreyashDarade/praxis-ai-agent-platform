@@ -56,3 +56,8 @@ htmlcov/
 # Local tool config and the product brief - never committed here.
 .claude/
 Prompt.txt
+
+# Generated capabilities: written by the Capability Factory, never source.
+# Quarantined ones already ignored above; a promoted one (approval off)
+# lands in the package dir and is still a build artifact, not code to track.
+praxis/agents/skills/synthesized_*.py

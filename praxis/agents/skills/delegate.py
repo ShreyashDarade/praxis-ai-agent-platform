@@ -57,6 +57,8 @@ from praxis.agents.skill_registry import discover_skills, get_skill, register_sk
 from praxis.agents.subagent import AgentContext, all_manifests, discover_agents, get_agent
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
+from praxis.llm.catalogue import LLMCatalogue
+from praxis.llm.prompt_manager import PromptManager
 from praxis.semantic.loader import layer_from_dict
 
 _logger = structlog.get_logger(__name__)
@@ -189,11 +191,17 @@ class DelegateToSpecialistSkill(Skill):
             "Each is either a sentence, or an object naming a machine check: "
             "'succeeded', 'no_errors', 'has_evidence', 'non_empty_result', "
             "'min_rows' (with 'expected'), 'output_keys' (with 'expected'), "
-            "'has_artifact'"
+            "'has_artifact'. NOTE: 'output_keys' names keys the specialist RETURNS "
+            "(metric_validator returns valid/issues/blocking/advisory; sql_analyst "
+            "returns rows/row_count/columns/query; chart_designer returns "
+            "chart_type/encoding/alt_text), never the inputs you passed it - a "
+            "criterion demanding an input name back will always fail."
         ),
     }
     outputs = {
         "agent": "the specialist that ran",
+        "objective": "the objective this delegation was given",
+        "inputs_given": "names of the inputs handed to the specialist",
         "succeeded": "whether the specialist reported success AND the critic accepted it",
         "results": "the specialist's own structured output",
         "evidence": "what the specialist did, as verifiable records",
@@ -288,7 +296,13 @@ class DelegateToSpecialistSkill(Skill):
         )
         result = await registry.run_bounded(lambda: agent.execute(context))
 
-        review = await Critic().review(child, result)
+        # A critic WITH a reviewer model. Constructed bare, the critic
+        # marks every judgement-based criterion unverified-and-failed -
+        # honest, but it meant any prose criterion a planner wrote made
+        # the delegation fail unconditionally. Machine criteria never
+        # reach the model, so this costs a call only when a judgement
+        # was actually asked for.
+        review = await Critic(LLMCatalogue(), PromptManager()).review(child, result)
         _logger.info(
             "delegation_completed",
             agent=agent_name,
@@ -313,6 +327,12 @@ class DelegateToSpecialistSkill(Skill):
 
         return {
             "agent": agent_name,
+            # What this delegation was asked to do, on the result itself.
+            # A reviewer reading the output alone otherwise cannot tell
+            # which sub-task it answers, and a trace with several
+            # delegations to one specialist is unreadable without it.
+            "objective": objective,
+            "inputs_given": sorted(str(k) for k in (kwargs.get("inputs") or {})),
             "succeeded": bool(result.succeeded and review.accepted),
             "results": result.results,
             "evidence": result.evidence,

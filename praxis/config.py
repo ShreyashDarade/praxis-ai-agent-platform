@@ -143,6 +143,20 @@ class Settings(BaseSettings):
         description="Times a failed plan may be re-planned with the failure as context",
     )
 
+    # Whether a task that ran without errors must also be judged BY A
+    # MODEL to have answered its intent before it is reported
+    # completed. The completion gate's deterministic checks always run
+    # regardless; this switches on the reviewer. Off by default because
+    # on means one real provider call per finished task - a deployment
+    # opts into that cost knowingly, and a test suite never pays it by
+    # accident (with a provider key in the environment, the default-on
+    # version made every API test that completed a task call Anthropic,
+    # and the suite timed out).
+    verify_completion: bool = Field(
+        default=False,
+        description="Judge a finished task's result against its intent before accepting it",
+    )
+
     retain_checkpoints_after_completion: bool = Field(
         default=True,
         description="Keep a finished task's checkpoints so its run stays replayable",

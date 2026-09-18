@@ -70,6 +70,7 @@ from praxis.agents.skills.delegate import release_delegation_state
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.config import Settings
 from praxis.core.checkpoint import PraxisCheckpointSaver
+from praxis.core.completion import CompletionGate
 from praxis.core.events import TaskEventBus, task_event_bus, task_state_snapshot
 from praxis.core.exceptions import (
     SandboxViolationError,
@@ -83,6 +84,7 @@ from praxis.core.execution_mode import (
     visible_skills,
 )
 from praxis.core.graph_engine import build_task_graph
+from praxis.core.harness import Attempt, Ledger, RetryRefused, StopCause
 from praxis.core.interfaces import Connector, GraphStore
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
 from praxis.memory.db import PostgresStore
@@ -183,6 +185,11 @@ class _TaskContext:
     # one.
     in_flight: dict[str, asyncio.Future] = field(default_factory=dict)
     cancelled: bool = False
+    # The evidence-ledger attempt this run belongs to, so `_settle`
+    # can turn each step's outcome into a claim with a verdict. None
+    # when the context was rebuilt to resume a task in a fresh
+    # process, where no attempt is open.
+    attempt: Attempt | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +204,9 @@ class _AttemptOutcome:
     status: str
     failure_text: str
     correlation_id: str
+    # True when the harness refused this attempt's plan as a repeat of
+    # a refuted one. The blocker is already written; the loop stops.
+    stalled: bool = False
 
 
 def _expected_output_keys(all_steps: list[PlanStep], step_index: int) -> set[str]:
@@ -267,6 +277,7 @@ class Orchestrator:
         checkpointer: Any | None = None,
         retain_checkpoints: bool | None = None,
         max_replan_attempts: int | None = None,
+        completion_gate: CompletionGate | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
@@ -286,6 +297,17 @@ class Orchestrator:
         self._retain_checkpoints = retain_checkpoints
         self._max_replan_attempts_override = max_replan_attempts
         self._contexts: dict[str, _TaskContext] = {}
+        # The completion gate (`praxis.core.completion`). The default
+        # runs only its deterministic checks; a deployment that wants
+        # a model to judge whether the result answers the intent
+        # passes a gate built with a reviewing `Critic`. Opt-in by
+        # construction so no test double ever makes a network call.
+        self._gate = completion_gate if completion_gate is not None else CompletionGate()
+        # One evidence ledger per task being driven. Owned by
+        # `drive_task`, which creates it before the first attempt and
+        # drops it when it returns - NOT by `_release_thread`, which
+        # runs after every attempt and would lose the earlier ones.
+        self._ledgers: dict[str, Ledger] = {}
 
     @functools.cached_property
     def _planner_accepts_prior_failures(self) -> bool:
@@ -331,6 +353,22 @@ class Orchestrator:
             return False
         parameters = signature.parameters
         return "prior_episodes" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    @functools.cached_property
+    def _planner_accepts_refuted_claims(self) -> bool:
+        """Whether this planner can be shown the ledger's verdicts.
+
+        Same probe, same reason, as `_planner_accepts_prior_failures`.
+        """
+        try:
+            signature = inspect.signature(self._planner.plan)
+        except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
+            return False
+        parameters = signature.parameters
+        return "refuted_claims" in parameters or any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         )
@@ -1086,14 +1124,47 @@ class Orchestrator:
           `_planner_accepts_prior_failures`), because re-planning blind
           reproduces the identical plan by construction.
         """
+        ledger = Ledger(task_id)
+        self._ledgers[task_id] = ledger
+        try:
+            return await self._drive_with_ledger(
+                task_id, ledger, principal=principal
+            )
+        finally:
+            self._ledgers.pop(task_id, None)
+
+    async def _drive_with_ledger(
+        self, task_id: str, ledger: Ledger, *, principal: Principal
+    ) -> str:
         attempt = 0
         prior_failures = ""
         while True:
             outcome = await self._drive_attempt(
-                task_id, principal=principal, prior_failures=prior_failures
+                task_id, principal=principal, prior_failures=prior_failures, ledger=ledger
             )
             attempt += 1
-            if outcome.status != "failed" or attempt > self._max_replan_attempts:
+            if outcome.status != "failed":
+                if outcome.status == "completed":
+                    ledger.stop(StopCause.GOAL_REACHED)
+                elif outcome.status == "cancelled":
+                    ledger.stop(StopCause.CANCELLED)
+                else:
+                    ledger.stop(StopCause.PAUSED)
+                await self._persist_ledger(task_id, ledger)
+                return task_id
+            if outcome.stalled:
+                # `_drive_attempt` refused the plan as a repeat of a
+                # refuted one and already wrote the blocker.
+                return task_id
+            if attempt > self._max_replan_attempts:
+                ledger.stop(
+                    StopCause.ATTEMPTS_EXHAUSTED,
+                    detail=(
+                        f"{attempt} attempt(s) made; the limit is "
+                        f"{self._max_replan_attempts + 1}"
+                    ),
+                )
+                await self._write_blocker(task_id, ledger)
                 return task_id
             if not self._planner_accepts_prior_failures:
                 with bind_correlation_id(outcome.correlation_id):
@@ -1102,6 +1173,14 @@ class Orchestrator:
                         task_id=task_id,
                         planner=type(self._planner).__name__,
                     )
+                ledger.stop(
+                    StopCause.PLANNER_CANNOT_REPLAN,
+                    detail=(
+                        f"planner {type(self._planner).__name__} cannot be shown "
+                        "what failed, so re-planning would reproduce the same plan"
+                    ),
+                )
+                await self._write_blocker(task_id, ledger)
                 return task_id
             if outcome.failure_text and outcome.failure_text == prior_failures:
                 # The same plan failed the same way. Another attempt
@@ -1112,6 +1191,11 @@ class Orchestrator:
                         task_id=task_id,
                         attempt=attempt,
                     )
+                ledger.stop(
+                    StopCause.STALLED,
+                    detail="the same plan failed the same way twice",
+                )
+                await self._write_blocker(task_id, ledger)
                 return task_id
             prior_failures = outcome.failure_text
 
@@ -1135,6 +1219,38 @@ class Orchestrator:
                     max_attempts=self._max_replan_attempts,
                 )
 
+
+    async def _persist_ledger(self, task_id: str, ledger: Ledger) -> None:
+        """Writes the ledger to its task row. Never raises: a task that
+        finished must not be reported as failed because its history
+        could not be saved."""
+        try:
+            async with self._store.session() as session:
+                task = await session.get(Task, task_id)
+                if task is None:
+                    return
+                task.ledger = ledger.to_dict()
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            _logger.warning("ledger_persist_failed", task_id=task_id, error=str(exc))
+
+    async def _write_blocker(self, task_id: str, ledger: Ledger) -> None:
+        """Attaches the harness's blocker to a stopped task's result.
+
+        The blocker is the diagnosis - what was tried, what each
+        attempt established, what was never reached - where the
+        `error` field is only the last symptom.
+        """
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+            if task is None:
+                return
+            result = dict(task.result or {})
+            result["blocker"] = ledger.blocker
+            task.result = result
+            task.ledger = ledger.to_dict()
+            await session.commit()
+        await self._publish_state(task)
 
     async def _outcome(self, task_id: str) -> _AttemptOutcome:
         """Reads back what one attempt actually produced.
@@ -1175,6 +1291,7 @@ class Orchestrator:
         *,
         principal: Principal = SYSTEM_PRINCIPAL,
         prior_failures: str = "",
+        ledger: Ledger | None = None,
     ) -> _AttemptOutcome:
         """One plan-and-execute pass.
 
@@ -1237,6 +1354,10 @@ class Orchestrator:
             recalled = await self._recall_episodes(intent_text, principal)
             if recalled and self._planner_accepts_prior_episodes:
                 plan_kwargs["prior_episodes"] = recalled
+            if ledger is not None and self._planner_accepts_refuted_claims:
+                verdicts = ledger.refuted_summary()
+                if verdicts:
+                    plan_kwargs["refuted_claims"] = verdicts
             steps = await self._planner.plan(
                 intent_text,
                 visible_skills(self._skills.all_skills(), mode),
@@ -1296,6 +1417,35 @@ class Orchestrator:
                 _logger.info("task_plan_only_completed", task_id=task_id, steps=len(steps))
             return await self._outcome(task_id)
 
+        # The harness admits or refuses the plan BEFORE anything runs.
+        # A plan identical to one already refuted is a stall - the
+        # same skills with the same arguments fail the same way - and
+        # running it again would spend real tool calls to learn
+        # nothing. `justification` is the computed difference from
+        # the last refuted plan; empty on a first attempt.
+        attempt_record: Attempt | None = None
+        if ledger is not None:
+            try:
+                justification = ledger.check_retry(steps)
+            except RetryRefused as exc:
+                ledger.stop(StopCause.STALLED, detail=str(exc))
+                with bind_correlation_id(correlation_id):
+                    _logger.info(
+                        "task_replan_refused_identical_plan",
+                        task_id=task_id,
+                        matches_attempt=exc.matches_attempt,
+                    )
+                await self._fail_task(task_id, f"stalled: {exc}", checklist=checklist)
+                await self._write_blocker(task_id, ledger)
+                settled = await self._outcome(task_id)
+                return _AttemptOutcome(
+                    status=settled.status,
+                    failure_text=settled.failure_text,
+                    correlation_id=settled.correlation_id,
+                    stalled=True,
+                )
+            attempt_record = ledger.open_attempt(steps, justification=justification)
+
         async with self._store.session() as session:
             stored = await session.get(Task, task_id)
             assert stored is not None
@@ -1311,6 +1461,7 @@ class Orchestrator:
             mode=mode,
             connector=connector,
             connector_name=connector_name,
+            attempt=attempt_record,
         )
         self._contexts[task_id] = context
 
@@ -1395,14 +1546,63 @@ class Orchestrator:
     async def _settle(
         self, task_id: str, context: _TaskContext, final: dict[str, Any]
     ) -> None:
-        """Writes the terminal task state from the graph's final state."""
+        """Writes the terminal task state from the graph's final state.
+
+        Two things happen here that did not before. The completion
+        gate judges an error-free run before it is called completed -
+        "every step ran" and "the question was answered" are
+        different claims, and a refuted gate is a failure the harness
+        re-plans from. And every step becomes a claim in the ledger
+        with a verdict its own outcome decided.
+        """
         results = dict(final.get("results", {}))
         errors = list(final.get("errors", []))
-
+        step_status = {
+            int(index): str(state)
+            for index, state in dict(final.get("step_status", {})).items()
+        }
         async with self._store.session() as session:
             task = await session.get(Task, task_id)
             assert task is not None
             checklist = [dict(item) for item in task.checklist]
+            intent_text = task.intent_text
+            stored_ledger = task.ledger
+
+        # In memory while `drive_task` is running this task. Absent
+        # when a task paused for approval is being resumed - `drive_task`
+        # returned at the pause and dropped it - so the persisted copy
+        # is rehydrated rather than replaced: building a fresh ledger
+        # here would overwrite the attempts recorded before the pause.
+        resumed = task_id not in self._ledgers
+        ledger = self._ledgers.get(task_id) or Ledger.from_dict(stored_ledger, task_id)
+
+        # The gate may call a model, so it runs outside any session.
+        verification: dict[str, Any] | None = None
+        if not errors:
+            gate = await self._gate.verify(
+                task_id=task_id,
+                intent=intent_text,
+                steps=context.steps,
+                results=results,
+                errors=errors,
+            )
+            verification = gate.to_dict()
+            ledger.verification = verification
+            if not gate.accepted:
+                errors.append(f"completion check refuted the result: {gate.reason}")
+
+        if context.attempt is not None:
+            ledger.record_outcome(
+                context.attempt,
+                status="failed" if errors else "completed",
+                step_status=step_status,
+                results=results,
+                errors=errors,
+            )
+
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+            assert task is not None
 
             if errors:
                 task.status = "failed"
@@ -1414,6 +1614,16 @@ class Orchestrator:
             else:
                 task.status = "completed"
                 task.result = self._build_result(context.steps, results, checklist)
+            if verification is not None:
+                task.result = {**task.result, "verification": verification}
+            if resumed:
+                # No drive loop is running to set the stop cause for a
+                # resumed task; a clean settle reached its goal. A
+                # failed one is left without a cause deliberately -
+                # it was not stalled or exhausted, it was resumed once
+                # and failed, and the errors say why.
+                ledger.stop_cause = StopCause.GOAL_REACHED if not errors else None
+            task.ledger = ledger.to_dict()
             task.pending_input = None
             await session.commit()
 
@@ -1474,6 +1684,11 @@ class Orchestrator:
                 f"- [{value.get('outcome', 'unknown')}] {value.get('summary', '')}"
                 + (f" (skills used: {', '.join(map(str, skills))})" if skills else "")
             )
+            for dead_end in (detail.get("refuted_approaches") or [])[:3]:
+                lines.append(
+                    f"    refuted then: {dead_end.get('skill') or 'whole plan'} - "
+                    f"{str(dead_end.get('reason', ''))[:140]}"
+                )
         _logger.info("episodes_recalled", count=len(lines))
         return NEWLINE.join(lines)
 
@@ -1514,6 +1729,16 @@ class Orchestrator:
                     "steps": len(context.steps),
                     "skills": [step.skill_name for step in context.steps],
                     "mode": context.mode.value,
+                    # What this run learned NOT to do, so a later run
+                    # of the same intent starts past the dead ends.
+                    "refuted_approaches": (
+                        self._ledgers[task.id].refuted_approaches()
+                        if task.id in self._ledgers else []
+                    ),
+                    "verification": (
+                        self._ledgers[task.id].verification
+                        if task.id in self._ledgers else None
+                    ),
                 },
             )
             _logger.debug("episode_recorded", task_id=task.id, memory_id=episode.entry_id)

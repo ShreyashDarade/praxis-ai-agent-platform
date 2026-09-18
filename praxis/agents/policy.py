@@ -44,6 +44,7 @@ from typing import Any
 import structlog
 
 from praxis.agents.contract import TaskContract
+from praxis.agents.loop import _HYPOTHESIS_KEY as _LOOP_HYPOTHESIS_KEY
 from praxis.agents.loop import Action, ActionKind, Iteration
 from praxis.llm.catalogue import LLMCatalogue
 from praxis.llm.prompt_manager import PromptManager
@@ -60,6 +61,16 @@ _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 # must not spend its whole context replaying them, and the shape plus
 # the head of the data is what the next decision actually turns on.
 _MAX_OBSERVATION_CHARS = 15000
+
+# Reserved argument key for a hypothesis, owned by the loop (which
+# strips it before any tool runs and ignores it in stall detection).
+_HYPOTHESIS_KEY = _LOOP_HYPOTHESIS_KEY
+
+
+def strip_hypothesis(args: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Separates the policy's hypothesis from the tool's real arguments."""
+    clean = dict(args)
+    return clean, str(clean.pop(_HYPOTHESIS_KEY, "") or "")
 
 
 def _strip_fence(text: str) -> str:
@@ -107,6 +118,12 @@ def parse_action(response: str) -> Action:
     if kind is not ActionKind.FINISH and not target:
         raise ValueError(f"a '{kind.value}' action must name a target")
 
+    # The hypothesis rides in the args under a reserved key so the loop's
+    # own `Action` shape is unchanged; `format_history` reads it back to
+    # show each past action as a claim with a verdict.
+    hypothesis = str(raw.get("hypothesis") or "").strip()
+    if hypothesis and kind is not ActionKind.FINISH:
+        args = {**args, _HYPOTHESIS_KEY: hypothesis}
     return Action(
         kind=kind,
         target=target,
@@ -137,10 +154,18 @@ def format_history(iterations: list[Iteration]) -> str:
     for iteration in iterations:
         action = iteration.action
         observation = iteration.observation
+        real_args, hypothesis = strip_hypothesis(action.args)
         lines.append(
             f"Iteration {iteration.index}: {action.kind.value} '{action.target}' "
-            f"with args {json.dumps(action.args, default=str)}"
+            f"with args {json.dumps(real_args, default=str)}"
         )
+        if hypothesis:
+            # The verdict is the observation's, not the model's: a
+            # failed action refutes what it set out to show, a
+            # successful one confirms that the action produced what
+            # the hypothesis said it would.
+            verdict = "CONFIRMED" if observation.succeeded else "REFUTED"
+            lines.append(f"  hypothesis: {hypothesis}  [{verdict}]")
         if observation.succeeded:
             lines.append(f"  -> succeeded: {_summarize(observation.content)}")
         else:

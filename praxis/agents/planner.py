@@ -114,6 +114,7 @@ class Planner:
         connector: Connector | None = None,
         prior_failures: str = "",
         prior_episodes: str = "",
+        refuted_claims: str = "",
     ) -> list[PlanStep]:
         # inputs/outputs are formatted to a plain string here, in Python,
         # rather than with a nested {% for %} inside the template: Jinja's
@@ -153,6 +154,11 @@ class Planner:
             # `Orchestrator._record_episode`; until now nothing read it
             # back, which made episodic memory write-only.
             prior_episodes=prior_episodes,
+            # The evidence ledger's verdicts on every step tried so
+            # far (`praxis.core.harness.Ledger.refuted_summary`).
+            # Structured where `prior_failures` is prose: which steps
+            # are dead ends, which worked, which were never reached.
+            refuted_claims=refuted_claims,
             skills=[
                 {
                     "name": skill.name,

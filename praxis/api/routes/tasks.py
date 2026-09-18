@@ -187,6 +187,12 @@ async def get_task(
         "checklist": task.checklist,
         "pending_input": task.pending_input,
         "result": task.result,
+        # Every attempt, each step as a claim with a verdict and its
+        # evidence, the computed justification for each retry, the
+        # completion gate's verdict, and the blocker if the harness
+        # stopped. This is how a person learns WHY a task ended the
+        # way it did, rather than only that it did.
+        "ledger": task.ledger,
     }
 
 

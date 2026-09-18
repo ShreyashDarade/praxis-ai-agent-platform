@@ -224,6 +224,12 @@ class Task(Base):
     checklist: Mapped[list] = mapped_column(JSON, default=list)
     pending_input: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # The evidence ledger (`praxis.core.harness.Ledger`): every attempt,
+    # each step as a claim with a verdict and evidence, the computed
+    # justification for each retry, and the blocker if the harness
+    # stopped. History, like `plan`, not execution state - which is why
+    # it is a column and not part of the pruned checkpoint.
+    ledger: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
