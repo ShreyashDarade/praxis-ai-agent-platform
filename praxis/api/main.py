@@ -507,6 +507,7 @@ from praxis.api.routes import (  # noqa: E402
     conversations,
     dashboards,
     health,
+    investigations,
     memory,
     schedules,
     semantic,
@@ -525,6 +526,7 @@ app.include_router(skills.router)
 app.include_router(agents.router)
 app.include_router(memory.router)
 app.include_router(semantic.router)
+app.include_router(investigations.router)
 
 
 async def _bootstrap_default_tenant() -> None:
