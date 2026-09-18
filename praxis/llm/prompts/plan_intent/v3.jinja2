@@ -47,6 +47,17 @@ Your job now is to produce a plan that SUCCEEDS where that one failed.
 - If you do not yet know a data source's shape, make inspecting it the
   first step and derive the later steps from what it returns, rather
   than guessing again.
+- If a step failed because a skill was "quarantined pending approval"
+  or "not approved for execution", that capability was newly invented
+  by your previous plan and cannot run in this task - approval is a
+  human decision that will not happen mid-run. Do NOT invent another
+  new skill to replace it. Re-plan using ONLY the skills listed above,
+  and prefer doing the work in one of their existing arguments: a
+  skill that accepts an arbitrary query or expression can usually do
+  directly what the invented step was going to do.
+- If a later step failed with "references step N, which has no result
+  yet", that is a knock-on from step N's own failure, not a separate
+  problem. Fix step N and the rest follows.
 - If the error says your previous response was not a JSON array - for
   example "must be a JSON array of steps, got int" - then the plan was
   never the problem: you answered the question instead of planning it.

@@ -138,10 +138,17 @@ async def _resolve_inputs(supplied: dict[str, Any], tenant_id: str) -> dict[str,
     connector = resolved.get("connector")
     if isinstance(connector, str):
         registry = build_registry(Settings())
-        # KeyError from the registry is already clear and names the
-        # connectors that do exist, which is what the planner needs to
-        # correct itself on the next attempt.
-        resolved["connector"] = registry.get(connector)
+        try:
+            resolved["connector"] = registry.get(connector)
+        except KeyError:
+            # The registry's own KeyError names the connector that is
+            # missing but not the ones that exist, which leaves a
+            # re-plan guessing a second name. Listing them turns a
+            # dead end into a correctable error.
+            raise KeyError(
+                f"no connector named '{connector}' is registered; available connectors "
+                f"are {sorted(existing.name for existing in registry.all())}"
+            ) from None
 
     layer = resolved.get("semantic_layer")
     if isinstance(layer, dict):
@@ -168,6 +175,11 @@ class DelegateToSpecialistSkill(Skill):
             "object of inputs for the specialist. 'connector' may be given as a "
             "registered connector NAME and is resolved to the live connector; "
             "'semantic_layer' may be given as a metric-definition object. "
+            "NOTE: a 'connector' name is resolved against the deployment's "
+            "configured connector registry only. A bespoke or demo-only "
+            "database that is not in that registry cannot be reached through a "
+            "specialist at all, and a purpose-built capability must be "
+            "synthesized for it instead - delegating is not a way around that. "
             "sql_analyst takes {connector, query}; schema_analyst takes {connector}; "
             "chart_designer takes {rows}; metric_validator takes "
             "{rows, semantic_layer, metrics}"
