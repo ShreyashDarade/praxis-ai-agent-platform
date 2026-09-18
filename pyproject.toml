@@ -82,6 +82,44 @@ dependencies = [
     # of every connector query. Pinned to the version actually resolved
     # and verified in this venv, same discipline as every pin above.
     "sqlglot>=27.29,<28.0",
+    # Phase 20 (agentic loop). `langgraph` backs
+    # `praxis/agents/loop.py`. The first version of that module was
+    # hand-rolled; this replaced it, because LangGraph is
+    # purpose-built for cyclic agent graphs and provides - properly -
+    # several things that are genuinely hard to get right: bounded
+    # recursion, per-thread durable checkpointing, first-class
+    # interrupt/resume, and state history (the "replay/debug mode"
+    # the product brief requires, which the hand-rolled version had
+    # no way to offer).
+    #
+    # Scope note: this is used for the AGENTIC loop only. The
+    # deterministic `Orchestrator` deliberately stays as-is - it
+    # executes a DAG, which a plain executor already does well, and
+    # its approval path carries argument-hash binding, tenancy, and
+    # audit semantics that a rewrite would risk losing for no gain.
+    # `langgraph-checkpoint-postgres` is the durable checkpointer for
+    # deployments that want loop state to survive a restart.
+    "langgraph>=1.2,<2.0",
+    "langgraph-checkpoint-postgres>=3.1,<4.0",
+    # File-format parsers (spec §5 step 2). `python-pptx` backs
+    # `praxis/ingestion/parsers/presentation_parser.py` - pure Python
+    # over the OOXML package via `lxml` (already in this venv), with no
+    # native extension of its own and, unlike `unstructured`, no
+    # `python-magic` dependency to trip the Windows segfault documented
+    # below. Capped below 2.0: its 1.x line is the API the parser and
+    # its tests were written and verified against.
+    "python-pptx>=1.0,<2.0",
+    # `markdown-it-py` backs
+    # `praxis/ingestion/parsers/markdown_parser.py` - a real CommonMark
+    # parse, rendered to HTML and then reduced with `beautifulsoup4`,
+    # instead of a regex stripper that silently mishandles fenced code
+    # blocks and reference-style links. It was already installed here
+    # transitively; this makes the dependency direct and explicit rather
+    # than accidental, exactly as was done for `beautifulsoup4` and
+    # `python-docx` in Phase 3. Each pinned to the version actually
+    # resolved and verified in this venv, same discipline as every pin
+    # above.
+    "markdown-it-py>=4.2,<5.0",
 ]
 
 # Windows-only caveat, discovered and fixed while verifying this exact

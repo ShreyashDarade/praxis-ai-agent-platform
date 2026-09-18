@@ -32,7 +32,7 @@ from typing import Any
 
 from praxis.agents.skill import Skill
 from praxis.agents.skill_registry import register_skill
-from praxis.analytics.visualize import PlotlyVisualizer
+from praxis.analytics.visualize import SUPPORTED_CHART_TYPES, PlotlyVisualizer
 from praxis.config import Settings
 from praxis.memory.blob_store import LocalBlobStore, tenant_artifact_key
 from praxis.memory.models import DEFAULT_TENANT_ID
@@ -51,7 +51,10 @@ class CreateChartSkill(Skill):
     risk = "read_only"
     inputs = {
         "data": "list of row dicts to chart",
-        "chart_type": "bar|line|scatter",
+        # Derived from the visualizer rather than spelled out, so the
+        # description the Planner reads cannot drift out of step with
+        # what `render()` will actually accept.
+        "chart_type": "|".join(SUPPORTED_CHART_TYPES),
         "encoding": "dict mapping chart roles to column names",
     }
     outputs = {

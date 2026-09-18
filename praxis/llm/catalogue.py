@@ -32,8 +32,27 @@ from typing import Any
 
 import anthropic
 
+from praxis.agents.budget import BudgetTracker
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.core.interfaces import Cache
+from praxis.observability.metrics import (
+    LLM_LATENCY,
+    metrics,
+    record_cache,
+    record_llm_call,
+)
+
+# Rough prompt-size estimate for the PRE-call budget check only. It
+# deliberately does not try to be accurate: the real token counts come
+# from the provider's own usage report after the call. This exists so
+# a budget can refuse an obviously-too-large call before paying for
+# it, and ~4 characters per token is the standard rule of thumb for
+# English prose.
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(prompt: str) -> int:
+    return max(1, len(prompt) // _CHARS_PER_TOKEN)
 
 # Verified-available Claude model ids as of this phase. Do not invent
 # other model name strings - these are the only ones in use.
@@ -74,12 +93,17 @@ class LLMCatalogue:
         *,
         cache: Cache | None = None,
         cache_ttl_seconds: int | None = DEFAULT_CACHE_TTL_SECONDS,
+        budget: BudgetTracker | None = None,
     ) -> None:
         self._model_mapping: dict[str, str] = (
             dict(model_mapping) if model_mapping is not None else dict(DEFAULT_MODEL_MAPPING)
         )
         self._cache: Cache = cache if cache is not None else InMemoryCache()
         self._cache_ttl_seconds = cache_ttl_seconds
+        # Phase 14: optional, so every existing caller is unbudgeted
+        # exactly as before. When supplied, the budget is checked
+        # before each call and charged after it.
+        self._budget = budget
         # Real, load-bearing testability (see module docstring) - counts
         # actual `client.messages.create` calls, never cache hits.
         self.real_api_calls = 0
@@ -115,16 +139,47 @@ class LLMCatalogue:
 
         cached = await self._cache.get(cache_key)
         if cached is not None:
+            record_cache(True, scope="llm_response")
             return cached
+        record_cache(False, scope="llm_response")
+
+        # Phase 14: enforce the budget BEFORE the call, so an overrun
+        # is prevented rather than merely recorded afterwards. No
+        # tracker configured means unbudgeted, which is the historical
+        # behavior for every caller that does not supply one.
+        if self._budget is not None:
+            self._budget.check_llm_call(model, estimated_tokens=_estimate_tokens(prompt))
 
         client = anthropic.AsyncAnthropic()
         self.real_api_calls += 1
-        response = await client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-            **kwargs,
-        )
+        with metrics.time(LLM_LATENCY, {"model": model, "purpose": purpose}):
+            response = await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+                **kwargs,
+            )
         text = "".join(block.text for block in response.content if block.type == "text")
+
+        # Phase 17: real token and cost accounting, read off the
+        # provider's own usage report rather than estimated - an
+        # estimate would make the cost guardrail systematically wrong
+        # in whichever direction the estimator is biased.
+        usage = getattr(response, "usage", None)
+        tokens_in = int(getattr(usage, "input_tokens", 0) or 0)
+        tokens_out = int(getattr(usage, "output_tokens", 0) or 0)
+        cost_usd = 0.0
+        if self._budget is not None:
+            cost_usd = self._budget.record_llm_call(model, tokens_in, tokens_out)
+        else:
+            cost_usd = BudgetTracker().price_of(model, tokens_in, tokens_out)
+        record_llm_call(
+            model=model,
+            purpose=purpose,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        )
+
         await self._cache.set(cache_key, text, ttl_seconds=self._cache_ttl_seconds)
         return text

@@ -1,64 +1,52 @@
 # praxis/core/orchestrator.py
-"""The Orchestrator (spec §3, §7, §8, §9, §14): turns a `Task`'s intent
-into a materialized checklist and drives it through the execution
-graph, pausing for approval on any `mutating` step.
+"""The Orchestrator (spec §3, §7, §8, §9, §14), executed by LangGraph.
 
-**Capability synthesis (Phase 6, spec §3's "NO MATCH -> synthesize")**:
-when a `PlanStep` names a skill that isn't registered, and a
-`CapabilityFactory` was actually supplied (see `capability_factory`
-below), the Orchestrator asks it to synthesize one - real sandbox
-validation and all (`praxis.agents.capability_factory`) - before giving
-up. Per spec §8/§20, synthesis itself is never gated behind approval
-(only a *mutating* skill's actual execution is, exactly the same as any
-hand-written skill); if synthesis fails validation
-(`SynthesisValidationError`), the step - and the task - fails with the
-real detail, never silently. When no `CapabilityFactory` is supplied
-(the default - e.g. every pre-Phase-6 test in this file, and any
-deployment without Docker reachable), the old behavior holds exactly:
-an unregistered skill fails the task immediately, with a clear message.
+Turns a `Task`'s intent into a materialized checklist and drives it
+through an execution graph, pausing for approval on any `mutating`
+step.
 
-**Connector-aware synthesis (Phase 11, spec §16.2)**: `start_task` now
-takes an optional `connector_name` - when a caller (e.g. `POST /intent`'s
-`connector` field) names one, it's resolved through the
-`ConnectorRegistry` this Orchestrator was constructed with, *once*, up
-front, and the resolved `Connector` object is threaded through this
-task's whole run so that if/when a plan step needs synthesis,
-`capability_factory.synthesize(connector=...)` gets the real object -
-real schema introspection, real lineage edges, exactly like
-`praxis.agents.capability_factory`'s own connector-aware tests already
-exercise, just reached from here instead of only from a caller that
-constructs the Factory directly. An unknown `connector_name` is a
-clear, typed failure (the task fails with the real detail), never a
-silent ignore - this Orchestrator has no way to tell "the caller made a
-typo" apart from "proceed without one" otherwise. A bare `PlanStep`
-still carries no *per-step* connector signal (the Planner decomposes
-intents in general, not just connector-shaped ones) - one connector per
-task, resolved once, is the real, principled scope this phase's
-walkthrough actually needs, not a heuristic guess at a finer grain
-nothing in this codebase asks for yet.
+**Phase 21: migrated onto LangGraph.** The previous engine was a
+hand-rolled level-by-level driver - `compute_levels()` grouped steps
+into dependency levels, each level ran under `asyncio.gather`, and
+pauses were managed with in-memory bookkeeping (`paused_index`,
+`pending_args`) plus a bespoke checkpoint serializer. LangGraph now
+owns execution (`praxis.core.graph_engine`), which changes four
+things concretely:
 
-**Short-term vs. long-term state (spec §9)**: the execution graph's
-live state (`_TaskState` - resolved levels, in-flight args, partial
-results) is genuinely short-term - held only in `Orchestrator._active`,
-in-memory, keyed by task id, and dropped the moment a task reaches a
-terminal or paused state that doesn't need it further. The long-term,
-durable record - `checklist`, `pending_input`, `result`, `status` - is
-what actually lives in the `tasks` table and is all `GET /tasks/{id}`
-ever reads. This is a deliberate MVP trade-off: a process restart while
-a task is `awaiting_approval` loses that task's resumability (the DB
-still shows exactly what it was waiting on, but `resume_after_approval`
-against a fresh process would find no in-memory state) - acceptable for
-this phase, and the natural place a later phase would add durable
-graph-state persistence if that trade-off ever needs revisiting.
+1. **The DAG is the graph.** One node per `PlanStep`, edges from
+   `depends_on`; LangGraph's superstep model runs independent steps
+   concurrently on its own.
+2. **A pause is a real `interrupt()`**, resumed with
+   `Command(resume=...)`. LangGraph replays the interrupted node from
+   its start, so the approval check and the action it guards stay in
+   *one* function rather than being split across a pause site and a
+   separate resume path that had to reconstruct the same arguments.
+3. **Checkpointing is the library's** (`praxis.core.checkpoint`
+   implements LangGraph's `BaseCheckpointSaver` over Praxis's own
+   Postgres store). The previous serializer degraded unserializable
+   values to `repr()`; LangGraph's handles them properly.
+4. **Replay/time-travel** (`replay_history`) is now available for
+   tasks, which it was not before.
 
-**Why a level can't "partially" pause**: within one dependency level,
-steps are scanned in index order; the moment a step needs approval (or
-names an unregistered skill), the Orchestrator stops *before starting
-any step in that level* - even ones that would otherwise run
-concurrently alongside it - rather than running some now and leaving
-others stranded mid-level. Once nothing in the level needs to pause,
-every remaining step in it runs concurrently via `asyncio.gather`,
-exactly per spec §8.
+**What did NOT change, deliberately.** Every security-relevant
+decision is still made here, in this module, and was carried across
+unmodified rather than rewritten:
+
+- risk tiering (`should_pause_for_approval`);
+- identity-bound approval records, including the argument-hash
+  re-verification that makes an approval un-replayable against
+  different arguments;
+- tenancy on every write;
+- the two-layer execution-mode enforcement;
+- audit logging of every decision;
+- capability synthesis for an unregistered skill;
+- output validation, the tool-result cache, and the
+  prior-context URL allow-list.
+
+`compute_levels()` is still used - not to execute, but to *validate*:
+LangGraph would happily build a cyclic graph, and a plan with a cycle
+or an out-of-range dependency must fail with a clear "invalid plan"
+error before anything runs.
 """
 from __future__ import annotations
 
@@ -70,20 +58,22 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
+from langgraph.types import Command, interrupt
 
 from praxis.agents.planner import Planner
 from praxis.agents.skill import Skill
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.config import Settings
+from praxis.core.checkpoint import PraxisCheckpointSaver
 from praxis.core.events import TaskEventBus, task_event_bus, task_state_snapshot
+from praxis.core.exceptions import SandboxViolationError, SynthesisValidationError
 from praxis.core.execution_graph import PlanStep, compute_levels, resolve_args
 from praxis.core.execution_mode import (
     ExecutionMode,
     MutationNotPermittedError,
     visible_skills,
 )
-from praxis.core.exceptions import SandboxViolationError, SynthesisValidationError
+from praxis.core.graph_engine import build_task_graph
 from praxis.core.interfaces import Connector, GraphStore
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
 from praxis.memory.db import PostgresStore
@@ -105,18 +95,13 @@ _logger = structlog.get_logger(__name__)
 # Phase 9 (spec §6.1's "prior-context-only fetch"): the Orchestrator is
 # the one place that decides which URLs are legitimate fetch targets for
 # `web_read`/`web_crawl` - never the skill/connector itself, and never
-# an LLM's own freshly-generated output. `_extract_urls` regex-extracts
-# every http(s) URL substring out of a piece of *already-validated*
-# text (the task's own intent text, or an earlier step's own result) -
-# deliberately permissive matching is safe here specifically because
-# every candidate this ever runs against already qualifies as "prior
-# context" by definition; over-matching only ever widens what a later
-# fetch is allowed to target with text that was already trusted input,
-# it never admits anything an LLM invented on its own. Trailing prose
-# punctuation commonly following a URL in natural-language text (a
-# period, comma, closing paren/bracket/quote) is stripped, since it's
-# never actually part of the URL.
+# an LLM's own freshly-generated output. Deliberately permissive
+# matching is safe here specifically because every candidate this ever
+# runs against already qualifies as "prior context" by definition.
 _URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
+
+# A task in one of these will never transition again.
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 def _extract_urls(text: str) -> set[str]:
@@ -125,8 +110,7 @@ def _extract_urls(text: str) -> set[str]:
 
 class SkillRegistryLike(Protocol):
     """What the Orchestrator needs from a skill registry - satisfied by
-    the `praxis.agents.skill_registry` module itself (mirrors
-    `praxis.ingestion.pipeline.ParserRegistryLike`), or any stand-in
+    the `praxis.agents.skill_registry` module itself, or any stand-in
     exposing the same two functions in a test."""
 
     def get_skill(self, name: str) -> Skill: ...
@@ -135,10 +119,7 @@ class SkillRegistryLike(Protocol):
 
 
 class CapabilityFactoryLike(Protocol):
-    """What the Orchestrator needs from a Capability Factory - satisfied
-    by the real `praxis.agents.capability_factory.CapabilityFactory`, or
-    any stand-in exposing the same one method in a test (mirrors
-    `SkillRegistryLike` above)."""
+    """What the Orchestrator needs from a Capability Factory."""
 
     async def synthesize(
         self, need_description: str, *, connector: Any | None = None, task_id: str | None = None
@@ -146,84 +127,54 @@ class CapabilityFactoryLike(Protocol):
 
 
 class ConnectorRegistryLike(Protocol):
-    """What the Orchestrator needs from a connector registry (Phase 11,
-    spec §16.2) - satisfied by the real
-    `praxis.connectors.registry.ConnectorRegistry`, or any stand-in
-    exposing this one method in a test (mirrors `SkillRegistryLike`/
-    `CapabilityFactoryLike` above)."""
+    """What the Orchestrator needs from a connector registry."""
 
     def get(self, name: str) -> Connector: ...
 
 
 @dataclass
-class _TaskState:
-    """In-memory execution-graph state for one in-flight task (see module docstring).
+class _TaskContext:
+    """Per-run context that is NOT part of the graph's state.
 
-    `tool_cache` (spec §11's tool-result cache scope, "idempotent
-    read-only calls within a single task") is a fresh `InMemoryCache`
-    per task - this state object's own lifetime already IS one task's
-    execution (created in `start_task`, dropped in `_advance`/
-    `resume_after_approval` on a terminal outcome per the module
-    docstring's "short-term vs. long-term state" note), so a fresh
-    instance here naturally means the cache never outlives, or leaks
-    across, one task run.
+    Everything here is either non-serializable (a live `Connector`, a
+    cache) or a runtime-only concern (cancellation). The graph's own
+    state channel carries only JSON-ish data, which is what keeps a
+    checkpoint restorable - live objects are re-resolved by name
+    instead (see `_rebuild_context`).
     """
 
     steps: list[PlanStep]
-    levels: list[list[int]]
-    results: dict[int, Any] = field(default_factory=dict)
-    next_level: int = 0
-    paused_index: int | None = None
-    pending_args: dict[int, dict[str, Any]] = field(default_factory=dict)
-    tool_cache: InMemoryCache = field(default_factory=InMemoryCache)
-    # Phase 9 (spec §6.1): seeded from the task's own intent text in
-    # `start_task`, grown by `_merge_known_urls` every time a step's
-    # result is recorded below - passed into every skill call as the
-    # `known_urls` kwarg (see `_run_one` and `resume_after_approval`),
-    # which is exactly what `web_read`/`web_crawl` need to enforce
-    # "may only fetch a URL that already appears in validated task
-    # input or a prior tool result."
-    known_urls: set[str] = field(default_factory=set)
-    # Phase 11 (spec §16.2): the real `Connector` this task's
-    # `connector_name` (if any) resolved to at `start_task` time - `None`
-    # for the (still overwhelmingly common) case where a task names no
-    # connector at all. Threaded into `capability_factory.synthesize()`
-    # by `_synthesize_missing_skill` below whenever this task's plan
-    # needs a fresh capability synthesized.
-    connector: Connector | None = None
-    # Phase 12: who this task runs as, and therefore which tenant every
-    # row it writes (graph edges, artifacts, vector chunks) belongs to.
     principal: Principal = SYSTEM_PRINCIPAL
-    # Phase 13: the execution mode, re-checked before every step rather
-    # than only at plan time (see `praxis.core.execution_mode`).
     mode: ExecutionMode = ExecutionMode.EXECUTE
-    # Phase 14: cooperative cancellation. `cancel_task` sets this; the
-    # level loop checks it between levels and refuses to start further
-    # work. A step already in flight is allowed to finish - killing a
-    # half-applied external mutation mid-write would be worse than one
-    # extra completed step.
+    connector: Connector | None = None
+    connector_name: str | None = None
+    # Spec §11's tool-result cache: one task's lifetime, so a fresh
+    # instance per run means it can never leak across tasks.
+    tool_cache: InMemoryCache = field(default_factory=InMemoryCache)
+    # In-flight deduplication for identical read-only calls.
+    #
+    # The cache alone dedupes *sequential* repeats, but LangGraph runs
+    # independent steps concurrently, so two steps naming the same
+    # skill+args start together and both miss the cache. The first to
+    # arrive registers a future here; the others await it instead of
+    # issuing a second identical call. This replaces the previous
+    # engine's level-scoped "runner/alias" bookkeeping and is strictly
+    # more general - it dedupes across supersteps too, not just within
+    # one.
+    in_flight: dict[str, asyncio.Future] = field(default_factory=dict)
     cancelled: bool = False
-    cancelled_by: str | None = None
 
 
 def _expected_output_keys(all_steps: list[PlanStep], step_index: int) -> set[str]:
-    """Scans every step's args for a `"$<step_index>.<key>"` reference -
-    i.e. what output key(s) a later step in this same plan already
-    expects `step_index`'s (about-to-be-synthesized) skill to return.
+    """What output key(s) a later step already expects `step_index` to
+    return.
 
-    Closes a real gap that would otherwise exist purely because the
-    Planner (which invents this key name, when it names a step whose
-    skill doesn't exist yet - spec §7/Phase 11's `plan_intent@v2`) and
-    the Capability Factory (which is what actually decides the
-    synthesized skill's real declared `outputs`) are two independent LLM
-    calls with no shared state between them - without this, a
-    downstream step could reference an output key the synthesized skill
-    never actually declared, and `resolve_args` would raise a `KeyError`
-    at run time for reasons neither LLM call could see coming. Feeding
-    the real, already-committed key name(s) back into the synthesis
-    `need_description` (see `_synthesize_missing_skill`) means the
-    Factory's LLM call knows exactly what shape is already expected of
-    it.
+    Closes a real gap: the Planner (which invents the key name when it
+    names a not-yet-existing skill) and the Capability Factory (which
+    decides the synthesized skill's real `outputs`) are two independent
+    LLM calls with no shared state. Feeding the already-committed key
+    name into the synthesis prompt means the Factory knows exactly what
+    shape is expected of it.
     """
     keys: set[str] = set()
     prefix = f"${step_index}."
@@ -238,19 +189,33 @@ def _describe_step(step: PlanStep) -> str:
     return f"{step.skill_name}({step.args})"
 
 
-# A task in one of these will never transition again - `cancel_task`
-# treats a duplicate cancel of one of these as a no-op rather than an
-# error, and `praxis.api.routes.tasks`'s WS stream uses the same set to
-# know when to stop forwarding.
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-
-
 def _tool_result_cache_key(skill_name: str, args: dict[str, Any]) -> str:
-    """Cache key for the tool-result scope: identical `skill_name` +
-    `args` (a read-only skill call is idempotent per spec §11) hash to
-    the same key, regardless of the args dict's key insertion order."""
+    """Identical `skill_name` + `args` hash to the same key regardless
+    of dict ordering - a read-only call is idempotent (spec §11)."""
     payload = json.dumps({"skill": skill_name, "args": args}, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _plan_to_json(steps: list[PlanStep]) -> list[dict[str, Any]]:
+    return [
+        {
+            "skill_name": step.skill_name,
+            "args": step.args,
+            "depends_on": list(step.depends_on),
+        }
+        for step in steps
+    ]
+
+
+def _plan_from_json(payload: list[dict[str, Any]]) -> list[PlanStep]:
+    return [
+        PlanStep(
+            skill_name=raw["skill_name"],
+            args=dict(raw.get("args") or {}),
+            depends_on=list(raw.get("depends_on") or []),
+        )
+        for raw in payload or []
+    ]
 
 
 class Orchestrator:
@@ -265,47 +230,24 @@ class Orchestrator:
         graph_store: GraphStore | None = None,
         audit_logger: AuditLogger | None = None,
         approval_ttl_seconds: int | None = None,
+        checkpointer: Any | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
         self._skills = skills
         self._capability_factory = capability_factory
-        # Defaults to the process-global bus (`praxis.core.events.
-        # task_event_bus`) - the same instance the `WS /tasks/{id}/
-        # stream` route subscribes to (praxis.api.main) - so every
-        # pre-existing caller (every test in this file included)
-        # continues to work unchanged, with live events simply
-        # published nowhere in particular unless something subscribes.
-        # A test wanting an isolated bus can still pass its own.
         self._event_bus = event_bus if event_bus is not None else task_event_bus
-        # Phase 11 (spec §16.2): additive, defaults to `None` exactly
-        # like `capability_factory` above - every pre-Phase-11 caller
-        # (every test in this file that doesn't pass one) gets byte-for-
-        # byte the old behavior: a task naming no `connector_name` never
-        # touches this at all, and a task that does with no registry
-        # configured fails clearly (see `start_task`) rather than
-        # silently proceeding as if no connector had been named.
         self._connector_registry = connector_registry
-        # Phase 11 (spec §16.1 step 8's "the lineage graph records every
-        # skill/tool used" - a general property of every task, not
-        # something reserved for freshly-synthesized skills, which is
-        # all Phase 6's `CapabilityFactory._register()` records on its
-        # own). Additive and optional, same posture as every dependency
-        # above: `None` (the default) means lineage recording is simply
-        # skipped, byte-for-byte the pre-Phase-11 behavior for every
-        # test/caller that doesn't pass one.
         self._graph_store = graph_store
-        # Phase 12: the audit trail. Optional and defaulting to one
-        # built over this Orchestrator's own store, so every caller
-        # (including every pre-Phase-12 test) gets real auditing with no
-        # constructor change, while a test wanting to assert on audit
-        # rows can inject its own.
         self._audit = audit_logger if audit_logger is not None else AuditLogger(store)
-        # Resolved lazily-but-once: reading Settings() here would make
-        # constructing an Orchestrator fail on an unconfigured
-        # environment, which several tests deliberately do.
         self._approval_ttl_seconds = approval_ttl_seconds
-        self._active: dict[str, _TaskState] = {}
+        # LangGraph checkpointing over Praxis's own store. Defaulting
+        # to a real one means every caller gains durable pause/resume
+        # with no constructor change.
+        self._checkpointer = (
+            checkpointer if checkpointer is not None else PraxisCheckpointSaver(store)
+        )
+        self._contexts: dict[str, _TaskContext] = {}
 
     @property
     def _approval_ttl(self) -> int:
@@ -316,6 +258,10 @@ class Orchestrator:
         except Exception:  # noqa: BLE001 - an unconfigured env must not break a pause
             return 3600
 
+    # ------------------------------------------------------------------ #
+    # Small helpers
+    # ------------------------------------------------------------------ #
+
     async def _record_skill_used(self, task_id: str, skill_name: str, tenant_id: str) -> None:
         if self._graph_store is None:
             return
@@ -324,60 +270,437 @@ class Orchestrator:
         )
 
     async def _publish_state(self, task: Task) -> None:
-        """Publishes a live snapshot of `task` to any `WS /tasks/{id}/
-        stream` subscriber (spec §14) - called right after every commit
-        below that actually changes `status`/`checklist`/`pending_input`/
-        `result`, never as a periodic heartbeat. Safe to read `task`'s
-        attributes here, straight off the same ORM object just
-        committed, with no extra query - `PostgresStore`'s session
-        factory sets `expire_on_commit=False` (praxis/memory/db.py)
-        specifically so this kind of post-commit read never needs one.
-        """
+        """Publishes a live snapshot to any `WS /tasks/{id}/stream`
+        subscriber, right after a commit that changed real state."""
         await self._event_bus.publish(task.id, task_state_snapshot(task))
 
-    # ------------------------------------------------------------------ #
-    # Checklist helpers
-    # ------------------------------------------------------------------ #
+    async def _update_checklist(
+        self, task_id: str, index: int, *, status: str, reason: str | None = None
+    ) -> None:
+        """Marks one checklist item and publishes the change.
+
+        Loads the row fresh each time because steps run concurrently:
+        two nodes finishing together must not overwrite each other's
+        checklist update, and re-reading inside the transaction is what
+        prevents that. The list is reassigned rather than mutated in
+        place so SQLAlchemy's change tracking on the plain `JSON`
+        column actually sees the write.
+        """
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+            if task is None:  # pragma: no cover - defensive
+                return
+            checklist = [dict(item) for item in task.checklist]
+            if index < len(checklist):
+                checklist[index] = {**checklist[index], "status": status, "reason": reason}
+                task.checklist = checklist
+            await session.commit()
+        await self._publish_state(task)
+
+    async def _fail_task(
+        self, task_id: str, message: str, *, checklist: list[dict[str, Any]] | None = None
+    ) -> None:
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+            assert task is not None
+            if checklist is not None:
+                task.checklist = checklist
+            task.status = "failed"
+            task.result = {"error": message}
+            await session.commit()
+        await self._publish_state(task)
+        await self._checkpointer.adelete_thread(task_id)
 
     @staticmethod
-    def _mark_item(task: Task, index: int, *, status: str, reason: str | None = None) -> None:
-        # Reassigns a fresh list (rather than mutating task.checklist[index]
-        # in place) so SQLAlchemy's change tracking on the plain `JSON`
-        # column actually sees the write - in-place mutation of a JSON
-        # column's Python value is invisible to the ORM without
-        # `sqlalchemy.ext.mutable`, which this schema deliberately
-        # doesn't add (see praxis/memory/models.py).
-        checklist = [dict(item) for item in task.checklist]
-        checklist[index] = {**checklist[index], "status": status, "reason": reason}
-        task.checklist = checklist
-
-    @staticmethod
-    def _merge_known_urls(state: _TaskState, value: Any) -> None:
-        """Grows `state.known_urls` from a just-recorded step result
-        (spec §6.1: "... or a prior tool result"). Called at every point
-        in this file that assigns into `state.results[...]` - a cache
-        hit, a freshly-run step, or an alias copying another step's
-        outcome - so a later step's `known_urls` kwarg always reflects
-        every URL surfaced by any step that has completed so far,
-        regardless of which of those three paths produced it."""
-        state.known_urls |= _extract_urls(str(value))
-
-    @staticmethod
-    def _build_result(state: _TaskState, checklist: list[dict[str, Any]]) -> dict[str, Any]:
+    def _build_result(
+        steps: list[PlanStep],
+        results: dict[int, Any],
+        checklist: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         completed = sum(1 for item in checklist if item["status"] == "completed")
         steps_summary = [
             {
                 "step": index,
                 "skill": step.skill_name,
-                "status": checklist[index]["status"],
-                "output": state.results.get(index),
+                "status": checklist[index]["status"] if index < len(checklist) else "unknown",
+                "output": results.get(index),
             }
-            for index, step in enumerate(state.steps)
+            for index, step in enumerate(steps)
         ]
         return {
             "summary": f"Task completed: {completed}/{len(checklist)} step(s) completed.",
             "steps": steps_summary,
         }
+
+    # ------------------------------------------------------------------ #
+    # The per-step node body - where every security control lives
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _settle_in_flight(
+        context: _TaskContext,
+        cache_key: str | None,
+        *,
+        result: Any = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Resolves (and clears) the in-flight future for `cache_key`.
+
+        Always called on both the success and failure paths: a future
+        left unresolved would hang every concurrent step waiting on
+        the same call, turning a deduplication optimization into a
+        deadlock.
+        """
+        if cache_key is None:
+            return
+        future = context.in_flight.pop(cache_key, None)
+        if future is None or future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+
+    def _make_step_runner(self, task_id: str, context: _TaskContext):
+        """Builds the `StepRunner` closure for one task's graph.
+
+        A closure rather than a method so the non-serializable context
+        (connector, cache, principal) stays out of LangGraph's state
+        channel while remaining reachable from every node.
+        """
+
+        async def run_step(
+            index: int,
+            step: PlanStep,
+            results: dict[int, Any],
+            known_urls: list[str],
+        ) -> dict[str, Any]:
+            if context.cancelled:
+                return {"step_status": {index: "skipped"}}
+
+            resolved_args = resolve_args(step.args, results)
+
+            # --- resolve or synthesize the skill ---------------------- #
+            try:
+                skill = self._skills.get_skill(step.skill_name)
+            except KeyError:
+                skill, synthesis_error = await self._synthesize_missing_skill(
+                    task_id, context, index, step, resolved_args
+                )
+                if skill is None:
+                    # The real sandbox/validation detail is propagated,
+                    # not collapsed into a generic "not registered" -
+                    # spec §12: a failure is never reduced to a message
+                    # that hides why it happened.
+                    return {
+                        "step_status": {index: "failed"},
+                        "errors": [f"step {index}: {synthesis_error}"],
+                    }
+
+            # --- execution-mode enforcement, layer 2 ------------------ #
+            # A mutating skill that reached this plan despite layer 1 -
+            # a freshly *synthesized* one is the real case, since it
+            # did not exist when the Planner's visible set was computed.
+            if skill.risk == "mutating" and not context.mode.allows_mutation:
+                if context.mode.simulates_mutation:
+                    simulated = {
+                        "simulated": True,
+                        "mode": context.mode.value,
+                        "would_have_called": {"skill": skill.name, "args": resolved_args},
+                        "note": (
+                            "dry run: this mutating step was NOT executed; no external "
+                            "state was changed"
+                        ),
+                    }
+                    _logger.info(
+                        "mutating_step_simulated",
+                        skill=skill.name, step=index, task_id=task_id,
+                        mode=context.mode.value,
+                    )
+                    await self._update_checklist(
+                        task_id, index, status="completed",
+                        reason=f"simulated ({context.mode.value})",
+                    )
+                    return {"results": {index: simulated}, "step_status": {index: "completed"}}
+
+                error = MutationNotPermittedError(
+                    (
+                        f"step {index} ('{skill.name}') is a mutating skill, which execution "
+                        f"mode '{context.mode.value}' does not permit "
+                        f"({context.mode.describe()})"
+                    ),
+                    mode=context.mode,
+                    skill_name=skill.name,
+                )
+                _logger.warning(
+                    "mutating_step_refused",
+                    skill=skill.name, step=index, task_id=task_id, mode=context.mode.value,
+                )
+                await self._audit.record(
+                    principal=context.principal,
+                    action="task:execute_step",
+                    resource_type="task",
+                    resource_id=task_id,
+                    decision="denied",
+                    reason=str(error),
+                    detail={"step": index, "skill": skill.name, "mode": context.mode.value},
+                )
+                await self._update_checklist(task_id, index, status="failed", reason=str(error))
+                return {"step_status": {index: "failed"}, "errors": [str(error)]}
+
+            # --- human approval --------------------------------------- #
+            if should_pause_for_approval(skill):
+                approved = await self._await_approval(
+                    task_id, context, index, step, resolved_args
+                )
+                if not approved:
+                    await self._update_checklist(
+                        task_id, index, status="skipped", reason="rejected by operator"
+                    )
+                    return {
+                        "step_status": {index: "skipped"},
+                        "errors": [
+                            f"step {index} ('{step.skill_name}') was rejected by the operator"
+                        ],
+                    }
+
+            # --- tool-result cache (read-only calls only) -------------- #
+            # Only `read_only` calls are ever cached or deduplicated: a
+            # `mutating` call is never assumed idempotent, and each one
+            # already pauses for its own individual approval.
+            cache_key: str | None = None
+            if skill.risk == "read_only":
+                cache_key = _tool_result_cache_key(skill.name, resolved_args)
+
+                cached = await context.tool_cache.get(cache_key)
+                if cached is not None:
+                    _logger.info(
+                        "tool_result_cache_hit", skill=skill.name, step=index, task_id=task_id
+                    )
+                    await self._record_skill_used(
+                        task_id, skill.name, context.principal.tenant_id
+                    )
+                    await self._update_checklist(task_id, index, status="completed")
+                    return {
+                        "results": {index: cached},
+                        "step_status": {index: "completed"},
+                        "known_urls": sorted(_extract_urls(str(cached))),
+                    }
+
+                # An identical call already running concurrently: wait
+                # for its result rather than issuing a second one.
+                pending = context.in_flight.get(cache_key)
+                if pending is not None:
+                    _logger.info(
+                        "tool_result_in_flight_join",
+                        skill=skill.name, step=index, task_id=task_id,
+                    )
+                    try:
+                        shared = await pending
+                    except Exception as exc:  # noqa: BLE001 - mirrors the runner's own failure
+                        await self._update_checklist(
+                            task_id, index, status="failed", reason=str(exc)
+                        )
+                        return {
+                            "step_status": {index: "failed"},
+                            "errors": [
+                                f"step {index} ('{skill.name}') failed: a concurrent "
+                                f"identical call failed: {exc}"
+                            ],
+                        }
+                    await self._record_skill_used(
+                        task_id, skill.name, context.principal.tenant_id
+                    )
+                    await self._update_checklist(task_id, index, status="completed")
+                    return {
+                        "results": {index: shared},
+                        "step_status": {index: "completed"},
+                        "known_urls": sorted(_extract_urls(str(shared))),
+                    }
+
+                context.in_flight[cache_key] = asyncio.get_running_loop().create_future()
+
+            # --- execute ----------------------------------------------- #
+            await self._update_checklist(task_id, index, status="in_progress")
+            _logger.info(
+                "skill_execution_started", skill=skill.name, step=index, task_id=task_id
+            )
+            try:
+                with start_span("skill.execute", skill=skill.name, step=index):
+                    output = await skill.run(
+                        **resolved_args,
+                        known_urls=set(known_urls),
+                        tenant_id=context.principal.tenant_id,
+                    )
+                output = validate_skill_output(skill.name, skill.outputs, output)
+            except Exception as exc:  # noqa: BLE001 - a step's failure, not swallowed (spec §12)
+                _logger.error(
+                    "skill_execution_failed",
+                    skill=skill.name, step=index, task_id=task_id, error=str(exc),
+                )
+                # Anything awaiting this exact call must fail too,
+                # rather than hanging on a future nobody will resolve.
+                self._settle_in_flight(context, cache_key, error=exc)
+                await self._update_checklist(task_id, index, status="failed", reason=str(exc))
+                return {
+                    "step_status": {index: "failed"},
+                    "errors": [f"step {index} ('{skill.name}') failed: {exc}"],
+                }
+
+            _logger.info(
+                "skill_execution_completed", skill=skill.name, step=index, task_id=task_id
+            )
+            if cache_key is not None:
+                await context.tool_cache.set(cache_key, output)
+                self._settle_in_flight(context, cache_key, result=output)
+            await self._record_skill_used(task_id, skill.name, context.principal.tenant_id)
+            await self._update_checklist(task_id, index, status="completed")
+
+            return {
+                "results": {index: output},
+                "step_status": {index: "completed"},
+                "known_urls": sorted(_extract_urls(str(output))),
+            }
+
+        return run_step
+
+    async def _await_approval(
+        self,
+        task_id: str,
+        context: _TaskContext,
+        index: int,
+        step: PlanStep,
+        resolved_args: dict[str, Any],
+    ) -> bool:
+        """Records the pending approval, pauses, and verifies on resume.
+
+        The whole approval lifecycle lives in one function because
+        LangGraph replays this node from its start on resume: the
+        arguments are recomputed from checkpointed upstream results
+        rather than stashed, and the hash check then proves they are
+        the same ones the operator actually saw.
+        """
+        pending = PendingInput(
+            kind="approval",
+            detail=(
+                f"approve mutating skill '{step.skill_name}' "
+                f"(step {index}) with args {resolved_args}?"
+            ),
+        )
+
+        # Idempotent by construction (`idempotency_key`), which matters
+        # precisely because this runs again on every replay.
+        async with self._store.session() as session:
+            await create_pending_approval(
+                session,
+                request=ApprovalRequest(
+                    task_id=task_id,
+                    step_index=index,
+                    skill_name=step.skill_name,
+                    args=resolved_args,
+                ),
+                tenant_id=context.principal.tenant_id,
+                ttl_seconds=self._approval_ttl,
+            )
+            task = await session.get(Task, task_id)
+            if task is not None:
+                checklist = [dict(item) for item in task.checklist]
+                if index < len(checklist):
+                    checklist[index] = {**checklist[index], "status": "awaiting_approval"}
+                    task.checklist = checklist
+                task.status = "awaiting_approval"
+                task.pending_input = pending.to_dict()
+            await session.commit()
+        if task is not None:
+            await self._publish_state(task)
+
+        # Pauses the graph here. On resume this whole function runs
+        # again and `interrupt` returns the resume payload instead.
+        #
+        # `step_index` travels in the payload so `resume_after_approval`
+        # can resume THIS interrupt specifically. That matters when two
+        # mutating steps pause in the same superstep: approving one
+        # must not blanket-approve the other, because each mutating
+        # action needs its own human decision.
+        decision = interrupt({**pending.to_dict(), "step_index": index})
+        approved = bool(decision.get("approved")) if isinstance(decision, dict) else bool(decision)
+
+        if approved:
+            # Re-verify at resume time (Prompt §8: "Recheck
+            # authorization when a paused or scheduled task resumes").
+            # A mismatch means the plan's arguments drifted from the
+            # ones a human approved, and is a hard refusal.
+            async with self._store.session() as session:
+                await verify_approval_binding(
+                    session,
+                    task_id=task_id,
+                    step_index=index,
+                    skill_name=step.skill_name,
+                    args=resolved_args,
+                )
+        return approved
+
+    async def _synthesize_missing_skill(
+        self,
+        task_id: str,
+        context: _TaskContext,
+        index: int,
+        step: PlanStep,
+        resolved_args: dict[str, Any],
+    ) -> tuple[Skill | None, str]:
+        """Synthesizes a skill the plan named but nothing provides.
+
+        Returns `(skill, "")` on success, or `(None, reason)` carrying
+        the *real* failure detail - the sandbox's own output, not a
+        generic message - so the caller can surface it on the task
+        rather than only in the checklist.
+        """
+        if self._capability_factory is None:
+            message = f"no skill named '{step.skill_name}' is registered"
+            _logger.warning(
+                "skill_not_registered_no_factory", skill=step.skill_name, step=index
+            )
+            await self._update_checklist(
+                task_id, index, status="skipped", reason=message
+            )
+            return None, message
+
+        need_description = (
+            f"A running plan needs a skill named '{step.skill_name}', to be called with "
+            f"keyword arguments {resolved_args!r} - no such skill is registered yet. "
+            "Synthesize a skill that fulfills this need, accepting exactly those keyword "
+            "argument names."
+        )
+        expected_keys = _expected_output_keys(context.steps, index)
+        if expected_keys:
+            plural = len(expected_keys) != 1
+            need_description += (
+                f"\n\nA later step in this same plan will read this skill's result using "
+                f"the key(s) {sorted(expected_keys)!r} (as \"$<this step's index>.<key>\") - "
+                f"your declared `outputs` MUST include exactly "
+                f"{'those keys' if plural else 'that key'}, and `run()` must return a dict "
+                f"containing {'them' if plural else 'it'}."
+            )
+
+        _logger.info(
+            "capability_synthesis_triggered", skill=step.skill_name, step=index, task_id=task_id
+        )
+        try:
+            skill = await self._capability_factory.synthesize(
+                need_description=need_description, connector=context.connector, task_id=task_id
+            )
+            return skill, ""
+        except (SynthesisValidationError, SandboxViolationError) as exc:
+            failure = (
+                f"no skill named '{step.skill_name}' is registered; capability synthesis "
+                f"also failed: {exc}"
+            )
+            _logger.error(
+                "capability_synthesis_failed",
+                skill=step.skill_name, step=index, task_id=task_id, error=str(exc),
+            )
+            await self._update_checklist(task_id, index, status="failed", reason=failure)
+            return None, failure
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -391,14 +714,7 @@ class Orchestrator:
         principal: Principal = SYSTEM_PRINCIPAL,
         mode: ExecutionMode = ExecutionMode.EXECUTE,
     ) -> str:
-        """Plans `intent_text` and drives it to completion (or a pause).
-
-        `principal` decides which tenant every row this task writes
-        belongs to, and is recorded on the task itself. `mode` decides
-        how far the task may go - and is enforced twice, once by
-        narrowing the skills the Planner can even see and again before
-        each step actually runs (see `praxis.core.execution_mode`).
-        """
+        """Plans `intent_text` and drives it to completion (or a pause)."""
         async with self._store.session() as session:
             task = Task(
                 tenant_id=principal.tenant_id,
@@ -407,6 +723,7 @@ class Orchestrator:
                 status="planning",
                 mode=mode.value,
                 checklist=[],
+                plan=[],
             )
             session.add(task)
             await session.commit()
@@ -431,12 +748,8 @@ class Orchestrator:
             correlation_id=correlation_id,
         )
 
-        # Phase 11 (spec §16.2): resolved once, up front - before the
-        # (real, potentially expensive) Planner call - so a caller-typo'd
-        # or unconfigured connector name fails fast and clearly, exactly
-        # like a Planner failure below, rather than silently proceeding
-        # with no connector and only surfacing the mismatch much later,
-        # deep inside a confusing synthesis failure.
+        # Resolved once, up front - before the (real, expensive)
+        # Planner call - so a typo'd connector fails fast and clearly.
         connector: Connector | None = None
         if connector_name is not None:
             if self._connector_registry is None:
@@ -446,8 +759,8 @@ class Orchestrator:
                 )
                 with bind_correlation_id(correlation_id):
                     _logger.error(
-                        "task_connector_resolution_failed", task_id=task_id,
-                        connector_name=connector_name, error=message,
+                        "task_connector_resolution_failed",
+                        task_id=task_id, connector_name=connector_name, error=message,
                     )
                 await self._fail_task(task_id, message, checklist=[])
                 return task_id
@@ -456,47 +769,48 @@ class Orchestrator:
             except KeyError as exc:
                 with bind_correlation_id(correlation_id):
                     _logger.error(
-                        "task_connector_resolution_failed", task_id=task_id,
-                        connector_name=connector_name, error=str(exc),
+                        "task_connector_resolution_failed",
+                        task_id=task_id, connector_name=connector_name, error=str(exc),
                     )
-                await self._fail_task(task_id, f"unknown connector '{connector_name}': {exc}", checklist=[])
+                await self._fail_task(
+                    task_id, f"unknown connector '{connector_name}': {exc}", checklist=[]
+                )
                 return task_id
 
         try:
-            # Enforcement layer 1 (spec: Prompt §8's "Plan mode must
-            # REMOVE or deny mutating tools"): under any mode that
-            # cannot mutate, the Planner is never even shown a mutating
-            # skill, so it cannot produce a plan naming one.
+            # Enforcement layer 1: under any mode that cannot mutate,
+            # the Planner is never shown a mutating skill.
             steps = await self._planner.plan(
-                intent_text,
-                visible_skills(self._skills.all_skills(), mode),
-                connector=connector,
+                intent_text, visible_skills(self._skills.all_skills(), mode), connector=connector
             )
-        except Exception as exc:  # noqa: BLE001 - a planning failure must fail the task, not crash the caller
+        except Exception as exc:  # noqa: BLE001 - a planning failure fails the task
             with bind_correlation_id(correlation_id):
                 _logger.error("task_planning_failed", task_id=task_id, error=str(exc))
             await self._fail_task(task_id, f"planning failed: {exc}", checklist=[])
             return task_id
 
         checklist = [
-            {"content": _describe_step(step), "status": "pending", "reason": None} for step in steps
+            {"content": _describe_step(step), "status": "pending", "reason": None}
+            for step in steps
         ]
 
+        # `compute_levels` is no longer the executor, but it is still
+        # the validator: LangGraph would happily build a cyclic graph,
+        # and a cycle or an out-of-range dependency must fail clearly
+        # before anything runs.
         try:
-            levels = compute_levels(steps)
+            compute_levels(steps)
         except ValueError as exc:
             await self._fail_task(task_id, f"invalid plan: {exc}", checklist=checklist)
             return task_id
 
-        # `plan_only`: the plan IS the deliverable. The task completes
-        # immediately with the full plan as its result and nothing is
-        # ever executed - not "executed with mutations skipped", which
-        # would be a different and much weaker guarantee.
+        # `plan_only`: the plan IS the deliverable.
         if not mode.allows_execution:
             async with self._store.session() as session:
                 task = await session.get(Task, task_id)
                 assert task is not None
                 task.checklist = checklist
+                task.plan = _plan_to_json(steps)
                 task.status = "completed"
                 task.result = {
                     "mode": mode.value,
@@ -512,7 +826,6 @@ class Orchestrator:
                         }
                         for index, step in enumerate(steps)
                     ],
-                    "levels": levels,
                 }
                 await session.commit()
             await self._publish_state(task)
@@ -524,44 +837,256 @@ class Orchestrator:
             task = await session.get(Task, task_id)
             assert task is not None
             task.checklist = checklist
+            task.plan = _plan_to_json(steps)
             task.status = "running"
             await session.commit()
         await self._publish_state(task)
 
-        self._active[task_id] = _TaskState(
+        context = _TaskContext(
             steps=steps,
-            levels=levels,
-            known_urls=_extract_urls(intent_text),
-            connector=connector,
             principal=principal,
             mode=mode,
+            connector=connector,
+            connector_name=connector_name,
         )
-        await self._advance(task_id)
+        self._contexts[task_id] = context
+
+        await self._drive(
+            task_id,
+            context,
+            initial={
+                "results": {},
+                "step_status": {},
+                "known_urls": sorted(_extract_urls(intent_text)),
+                "errors": [],
+            },
+        )
         return task_id
 
+    async def _drive(
+        self, task_id: str, context: _TaskContext, *, initial: Any
+    ) -> None:
+        """Runs (or resumes) the task graph and settles the final state."""
+        saver = self._checkpointer
+        if isinstance(saver, PraxisCheckpointSaver):
+            saver = saver.for_tenant(context.principal.tenant_id)
+
+        graph = build_task_graph(
+            context.steps, self._make_step_runner(task_id, context), checkpointer=saver
+        )
+        config = {
+            "configurable": {"thread_id": task_id},
+            # One superstep per step is the theoretical worst case
+            # (a fully sequential plan); +5 covers LangGraph's own
+            # bookkeeping passes.
+            "recursion_limit": max(10, len(context.steps) + 5),
+        }
+
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+            correlation_id = task.correlation_id if task else task_id
+
+        with bind_correlation_id(correlation_id):
+            with start_span("orchestrator.advance", task_id=task_id):
+                final = await graph.ainvoke(initial, config)
+
+            # A pending interrupt means the graph paused for approval;
+            # the task row already says `awaiting_approval`.
+            if "__interrupt__" in final:
+                _logger.info("task_advance_stopped", task_id=task_id, outcome="paused")
+                return
+
+            if context.cancelled:
+                _logger.info("task_advance_stopped", task_id=task_id, outcome="cancelled")
+                self._contexts.pop(task_id, None)
+                return
+
+            await self._settle(task_id, context, final)
+
+    async def _settle(
+        self, task_id: str, context: _TaskContext, final: dict[str, Any]
+    ) -> None:
+        """Writes the terminal task state from the graph's final state."""
+        results = dict(final.get("results", {}))
+        errors = list(final.get("errors", []))
+
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+            assert task is not None
+            checklist = [dict(item) for item in task.checklist]
+
+            if errors:
+                task.status = "failed"
+                task.result = {
+                    **self._build_result(context.steps, results, checklist),
+                    "error": errors[0] if len(errors) == 1 else "one or more steps failed",
+                    "errors": errors,
+                }
+            else:
+                task.status = "completed"
+                task.result = self._build_result(context.steps, results, checklist)
+            task.pending_input = None
+            await session.commit()
+
+        await self._publish_state(task)
+        _logger.info(
+            "task_completed" if not errors else "task_failed",
+            task_id=task_id,
+            steps=len(context.steps),
+        )
+        self._contexts.pop(task_id, None)
+        # Terminal: nothing left to resume, so retaining the thread
+        # would only accumulate dead state.
+        await self._checkpointer.adelete_thread(task_id)
+
+    async def _rebuild_context(self, task: Task) -> _TaskContext | None:
+        """Reconstructs run context for a task this process never started.
+
+        The plan comes from the durable `tasks.plan` column; the
+        connector is re-resolved **by name** rather than deserialized,
+        because a live connection cannot be serialized and restoring a
+        dead one would be worse than re-resolving. A connector that no
+        longer exists yields `None`, so the resume fails clearly rather
+        than proceeding against something that is gone.
+        """
+        steps = _plan_from_json(task.plan or [])
+        if not steps:
+            return None
+
+        try:
+            mode = ExecutionMode(task.mode)
+        except ValueError:  # pragma: no cover - defensive
+            mode = ExecutionMode.EXECUTE
+
+        return _TaskContext(
+            steps=steps,
+            principal=Principal(
+                tenant_id=task.tenant_id,
+                user_id=task.created_by_user_id,
+                roles=("system",),
+                is_system=True,
+            ),
+            mode=mode,
+        )
+
+    async def resume_after_approval(
+        self, task_id: str, approved: bool, *, principal: Principal = SYSTEM_PRINCIPAL
+    ) -> None:
+        """Records `principal`'s decision and resumes (or aborts) the task."""
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+            if task is None:
+                raise KeyError(f"no task with id '{task_id}'")
+            if task.status != "awaiting_approval":
+                raise ValueError(
+                    f"task '{task_id}' is not awaiting approval (status: '{task.status}')"
+                )
+            step_index = self._paused_index(task)
+
+            # Identity-bound, expiring, idempotent. A replayed call
+            # resolves to the same record rather than re-authorizing.
+            approval = await decide_approval(
+                session,
+                task_id=task_id,
+                step_index=step_index,
+                approved=approved,
+                principal=principal,
+            )
+            task.pending_input = None
+            task.status = "running"
+            await session.commit()
+            correlation_id = task.correlation_id
+
+        await self._publish_state(task)
+        await self._audit.record(
+            principal=principal,
+            action="task:approve",
+            resource_type="task",
+            resource_id=task_id,
+            decision="allowed" if approved else "denied",
+            reason=f"operator {'approved' if approved else 'rejected'} step {step_index}",
+            detail={"step": step_index, "approval_id": approval.id,
+                    "action_hash": approval.action_hash},
+            correlation_id=correlation_id,
+        )
+
+        context = self._contexts.get(task_id)
+        if context is None:
+            # A different process (or a restarted one) - rebuild from
+            # the durable plan; LangGraph's checkpoint supplies how far
+            # the task got.
+            async with self._store.session() as session:
+                task = await session.get(Task, task_id)
+            context = await self._rebuild_context(task) if task else None
+            if context is None:
+                raise ValueError(
+                    f"task '{task_id}' is awaiting approval but its plan could not be "
+                    "recovered; it cannot be resumed here"
+                )
+            self._contexts[task_id] = context
+
+        # Resume THIS step's interrupt only. With several mutating
+        # steps paused in the same superstep, a blanket resume would
+        # authorize actions no one approved - so the decision is
+        # addressed to one interrupt id.
+        resume_payload = await self._resume_payload(task_id, context, step_index, approved)
+        await self._drive(task_id, context, initial=Command(resume=resume_payload))
+
+    async def _resume_payload(
+        self, task_id: str, context: _TaskContext, step_index: int, approved: bool
+    ) -> Any:
+        """Builds the `Command(resume=...)` payload for one step.
+
+        Returns an `{interrupt_id: decision}` map when the matching
+        pending interrupt can be identified, and a bare decision when
+        there is only one - LangGraph accepts both, and the bare form
+        keeps the common single-pause case simple.
+        """
+        decision = {"approved": approved}
+        saver = self._checkpointer
+        if isinstance(saver, PraxisCheckpointSaver):
+            saver = saver.for_tenant(context.principal.tenant_id)
+        graph = build_task_graph(
+            context.steps, self._make_step_runner(task_id, context), checkpointer=saver
+        )
+        snapshot = await graph.aget_state({"configurable": {"thread_id": task_id}})
+        pending = list(getattr(snapshot, "interrupts", ()) or ())
+
+        if len(pending) <= 1:
+            return decision
+
+        for item in pending:
+            value = item.value if isinstance(item.value, dict) else {}
+            if value.get("step_index") == step_index:
+                return {item.id: decision}
+        return decision
+
+    @staticmethod
+    def _paused_index(task: Task) -> int:
+        """Which step the task is paused on, read from the checklist."""
+        for index, item in enumerate(task.checklist or []):
+            if item.get("status") == "awaiting_approval":
+                return index
+        return 0
+
     async def cancel_task(self, task_id: str, *, principal: Principal = SYSTEM_PRINCIPAL) -> bool:
-        """Cancels a running or paused task (Prompt §1).
+        """Cancels a running or paused task.
 
         Returns True when this call performed the cancellation, False
-        when the task was already in a terminal state (idempotent - a
-        duplicate cancel is not an error).
-
-        Cooperative by design: the flag is checked between levels and
-        before each step starts, so no step is ever killed mid-write.
-        Any in-flight level finishes, then the task stops.
+        when the task was already terminal (idempotent). Cooperative:
+        the flag is checked at the start of each step, so no step is
+        killed mid-write.
         """
         async with self._store.session() as session:
             task = await session.get(Task, task_id)
             if task is None:
                 raise KeyError(f"no task with id '{task_id}'")
-
             if task.status in _TERMINAL_STATUSES:
                 return False
 
-            state = self._active.get(task_id)
-            if state is not None:
-                state.cancelled = True
-                state.cancelled_by = principal.describe()
+            context = self._contexts.get(task_id)
+            if context is not None:
+                context.cancelled = True
 
             checklist = [dict(item) for item in task.checklist]
             for index, item in enumerate(checklist):
@@ -574,17 +1099,13 @@ class Orchestrator:
             task.checklist = checklist
             task.status = "cancelled"
             task.pending_input = None
-            partial = (
-                self._build_result(state, task.checklist)
-                if state is not None
-                else {"summary": "Task cancelled before any execution state existed."}
-            )
             task.result = {
-                **partial,
+                "summary": "Task cancelled.",
                 "cancelled_by": principal.describe(),
                 "error": "task was cancelled",
             }
             await session.commit()
+            correlation_id = task.correlation_id
 
         await self._publish_state(task)
         await self._audit.record(
@@ -593,506 +1114,50 @@ class Orchestrator:
             resource_type="task",
             resource_id=task_id,
             detail={"previous_status": "running"},
+            correlation_id=correlation_id,
         )
-        with bind_correlation_id(task.correlation_id):
+        with bind_correlation_id(correlation_id):
             _logger.info("task_cancelled", task_id=task_id, by=principal.describe())
-        self._active.pop(task_id, None)
+
+        self._contexts.pop(task_id, None)
+        await self._checkpointer.adelete_thread(task_id)
         return True
 
-    async def resume_after_approval(
-        self, task_id: str, approved: bool, *, principal: Principal = SYSTEM_PRINCIPAL
-    ) -> None:
-        """Records `principal`'s decision and resumes (or aborts) the task.
+    async def replay_history(self, task_id: str) -> list[dict[str, Any]]:
+        """Every checkpointed state for a task, newest first.
 
-        Two security controls run here before anything executes
-        (Prompt §8): the decision is written as an identity-bound,
-        expiring, idempotent `ApprovalRecord`, and the approval's
-        `action_hash` is re-verified against the arguments actually
-        about to run - so an approval can never be replayed against
-        different arguments than the human saw.
+        The brief's *"replay/debug mode"*: it reconstructs what the
+        task's execution looked like at each superstep, which is what
+        makes a run debuggable after the fact. Distinct from
+        re-executing it - nothing here has side effects.
         """
         async with self._store.session() as session:
-            # DB existence/status checked first (KeyError for a genuinely
-            # unknown task -> 404; ValueError for a known task in the
-            # wrong state -> 409, e.g. already completed) - only once
-            # both hold do we consult the in-memory execution state,
-            # whose own absence (e.g. a process restart) is a *different*
-            # 409 (spec §12: never conflate "doesn't exist" with "can't
-            # be resumed right now").
             task = await session.get(Task, task_id)
-            if task is None:
-                raise KeyError(f"no task with id '{task_id}'")
-            if task.status != "awaiting_approval":
-                raise ValueError(
-                    f"task '{task_id}' is not awaiting approval (status: '{task.status}')"
-                )
+        if task is None:
+            raise KeyError(f"no task with id '{task_id}'")
 
-            state = self._active.get(task_id)
-            if state is None or state.paused_index is None:
-                raise ValueError(
-                    f"task '{task_id}' is marked awaiting_approval in storage but has no "
-                    "in-memory execution state in this process (likely a process restart); "
-                    "it cannot be resumed here"
-                )
+        context = self._contexts.get(task_id) or await self._rebuild_context(task)
+        if context is None:
+            return []
 
-            with bind_correlation_id(task.correlation_id):
-                _logger.info("resume_after_approval_requested", task_id=task_id, approved=approved)
-
-                paused_index = state.paused_index
-                step = state.steps[paused_index]
-
-                # Record the decision as an identity-bound, expiring,
-                # idempotent approval record BEFORE acting on it. A
-                # replayed call resolves to the same record (no second
-                # authorization); an expired one raises rather than
-                # executing on a stale human decision.
-                approval = await decide_approval(
-                    session,
-                    task_id=task_id,
-                    step_index=paused_index,
-                    approved=approved,
-                    principal=principal,
-                )
-                await self._audit.record(
-                    principal=principal,
-                    action="task:approve",
-                    resource_type="task",
-                    resource_id=task_id,
-                    decision="allowed" if approved else "denied",
-                    reason=f"operator {'approved' if approved else 'rejected'} step {paused_index}",
-                    detail={
-                        "step": paused_index,
-                        "skill": step.skill_name,
-                        "approval_id": approval.id,
-                        "action_hash": approval.action_hash,
-                    },
-                    correlation_id=task.correlation_id,
-                )
-
-                if not approved:
-                    self._mark_item(task, paused_index, status="skipped", reason="rejected by operator")
-                    task.status = "failed"
-                    task.pending_input = None
-                    task.result = {
-                        "error": (
-                            f"step {paused_index} ('{step.skill_name}') was rejected by the "
-                            "operator; task aborted"
-                        )
-                    }
-                    _logger.info("task_rejected_by_operator", task_id=task_id, step=paused_index)
-                    await session.commit()
-                    await self._publish_state(task)
-                    self._active.pop(task_id, None)
-                    return
-
-                skill = self._skills.get_skill(step.skill_name)  # guaranteed registered - checked before the pause
-                resolved_args = state.pending_args[paused_index]
-
-                # Re-verify authorization at resume time (Prompt §8:
-                # "Recheck authorization when a paused or scheduled task
-                # resumes"). The binding check raises
-                # `ApprovalBindingError` if the arguments drifted from
-                # the ones the operator actually approved.
-                await verify_approval_binding(
-                    session,
-                    task_id=task_id,
-                    step_index=paused_index,
-                    skill_name=step.skill_name,
-                    args=resolved_args,
-                )
-
-                self._mark_item(task, paused_index, status="in_progress")
-                task.status = "running"
-                task.pending_input = None
-                await session.commit()
-                await self._publish_state(task)
-
-                _logger.info("skill_execution_started", skill=skill.name, step=paused_index, task_id=task_id)
-                try:
-                    with start_span("skill.execute", skill=skill.name, step=paused_index):
-                        # `known_urls` (spec §6.1) is injected here, out
-                        # of band from `resolved_args` - never merged
-                        # into it, so it never perturbs `pending_args`
-                        # (already captured before the pause) or any
-                        # tool-result cache key computed from it.
-                        output = await skill.run(
-                            **resolved_args,
-                            known_urls=set(state.known_urls),
-                            tenant_id=state.principal.tenant_id,
-                        )
-                        output = validate_skill_output(skill.name, skill.outputs, output)
-                except Exception as exc:  # noqa: BLE001 - a skill's own failure, not swallowed (spec §12)
-                    _logger.error(
-                        "skill_execution_failed", skill=skill.name, step=paused_index,
-                        task_id=task_id, error=str(exc),
-                    )
-                    self._mark_item(task, paused_index, status="failed", reason=str(exc))
-                    task.status = "failed"
-                    # Preserve whatever steps *did* complete before this
-                    # one failed (per _build_result, keyed off state.results
-                    # and the checklist's current per-item status) rather
-                    # than discarding them - a failed task's real, already-
-                    # gathered data (e.g. a fetched metric) stays visible
-                    # via task.result["steps"], matching this system's
-                    # "nothing silently vanishes" checklist philosophy
-                    # (spec §7) instead of collapsing to a bare error string.
-                    task.result = {
-                        **self._build_result(state, task.checklist),
-                        "error": f"step {paused_index} ('{step.skill_name}') failed: {exc}",
-                    }
-                    await session.commit()
-                    await self._publish_state(task)
-                    self._active.pop(task_id, None)
-                    return
-                _logger.info("skill_execution_completed", skill=skill.name, step=paused_index, task_id=task_id)
-
-                state.results[paused_index] = output
-                self._merge_known_urls(state, output)
-                state.paused_index = None
-                self._mark_item(task, paused_index, status="completed")
-                await self._record_skill_used(task_id, skill.name, state.principal.tenant_id)
-                await session.commit()
-                await self._publish_state(task)
-
-        await self._advance(task_id)
-
-    # ------------------------------------------------------------------ #
-    # Internal execution-graph driver
-    # ------------------------------------------------------------------ #
-
-    async def _fail_task(self, task_id: str, message: str, *, checklist: list[dict[str, Any]]) -> None:
-        async with self._store.session() as session:
-            task = await session.get(Task, task_id)
-            assert task is not None
-            task.checklist = checklist
-            task.status = "failed"
-            task.result = {"error": message}
-            await session.commit()
-        await self._publish_state(task)
-
-    async def _advance(self, task_id: str) -> None:
-        state = self._active[task_id]
-        async with self._store.session() as session:
-            task = await session.get(Task, task_id)
-            assert task is not None
-
-            with bind_correlation_id(task.correlation_id):
-                with start_span("orchestrator.advance", task_id=task_id):
-                    for level_pos in range(state.next_level, len(state.levels)):
-                        # Cooperative cancellation checkpoint: checked
-                        # between levels, so a cancel lands promptly
-                        # without ever interrupting a step mid-write.
-                        if state.cancelled:
-                            _logger.info(
-                                "task_advance_stopped", task_id=task_id, outcome="cancelled"
-                            )
-                            self._active.pop(task_id, None)
-                            return
-                        outcome = await self._process_level(session, task, state, level_pos)
-                        if outcome in ("paused", "failed"):
-                            _logger.info("task_advance_stopped", task_id=task_id, outcome=outcome)
-                            if outcome == "failed":
-                                self._active.pop(task_id, None)
-                            return
-                        state.next_level = level_pos + 1
-
-                    task.status = "completed"
-                    task.result = self._build_result(state, task.checklist)
-                    await session.commit()
-                await self._publish_state(task)
-                _logger.info("task_completed", task_id=task_id)
-        self._active.pop(task_id, None)
-
-    async def _synthesize_missing_skill(
-        self,
-        session: AsyncSession,
-        task: Task,
-        state: _TaskState,
-        index: int,
-        step: PlanStep,
-        resolved_args: dict[str, Any],
-    ) -> Skill | None:
-        """Called from `_process_level` the moment `step.skill_name` isn't
-        registered. Returns the newly-synthesized `Skill` on success, or
-        `None` after already marking the step/task `failed` (mirroring
-        every other failure branch in `_process_level`, which returns
-        `"failed"` right after calling this)."""
-        message = f"no skill named '{step.skill_name}' is registered"
-        if self._capability_factory is None:
-            _logger.warning("skill_not_registered_no_factory", skill=step.skill_name, step=index)
-            self._mark_item(task, index, status="skipped", reason=message)
-            task.status = "failed"
-            task.result = {"error": f"step {index}: {message}"}
-            await session.commit()
-            await self._publish_state(task)
-            return None
-
-        need_description = (
-            f"A running plan needs a skill named '{step.skill_name}', to be called with "
-            f"keyword arguments {resolved_args!r} - no such skill is registered yet. "
-            "Synthesize a skill that fulfills this need, accepting exactly those keyword "
-            "argument names."
+        saver = self._checkpointer
+        if isinstance(saver, PraxisCheckpointSaver):
+            saver = saver.for_tenant(task.tenant_id)
+        graph = build_task_graph(
+            context.steps, self._make_step_runner(task_id, context), checkpointer=saver
         )
-        # Phase 11: fold in whatever key(s) a later step in this same
-        # plan already committed to reading from this step's result -
-        # see `_expected_output_keys`'s own docstring for why this
-        # matters (the Planner and the Factory are two independent LLM
-        # calls with no shared state otherwise).
-        expected_keys = _expected_output_keys(state.steps, index)
-        if expected_keys:
-            plural = len(expected_keys) != 1
-            need_description += (
-                f"\n\nA later step in this same plan will read this skill's result using "
-                f"the key(s) {sorted(expected_keys)!r} (as \"$<this step's index>.<key>\") - "
-                f"your declared `outputs` MUST include exactly {'those keys' if plural else 'that key'}, "
-                f"and `run()` must return a dict containing {'them' if plural else 'it'}."
+
+        history: list[dict[str, Any]] = []
+        async for snapshot in graph.aget_state_history(
+            {"configurable": {"thread_id": task_id}}
+        ):
+            history.append(
+                {
+                    "step": snapshot.metadata.get("step") if snapshot.metadata else None,
+                    "next": list(snapshot.next),
+                    "completed_steps": sorted(snapshot.values.get("results", {})),
+                    "step_status": snapshot.values.get("step_status", {}),
+                    "errors": snapshot.values.get("errors", []),
+                }
             )
-        _logger.info("capability_synthesis_triggered", skill=step.skill_name, step=index, task_id=task.id)
-        try:
-            return await self._capability_factory.synthesize(
-                need_description=need_description, connector=state.connector, task_id=task.id
-            )
-        except (SynthesisValidationError, SandboxViolationError) as exc:
-            # Both are surfaced identically at the Orchestrator level
-            # (spec §12): a validation failure exhausts its own bounded
-            # retry inside the Factory; a sandbox violation (e.g. an
-            # OOM-killed synthesis attempt) is never retried by the
-            # Factory at all - either way, this step - and the task -
-            # fails with the real detail, never silently.
-            failure = f"{message}; capability synthesis also failed: {exc}"
-            _logger.error(
-                "capability_synthesis_failed", skill=step.skill_name, step=index,
-                task_id=task.id, error=str(exc),
-            )
-            self._mark_item(task, index, status="failed", reason=failure)
-            task.status = "failed"
-            task.result = {"error": f"step {index}: {failure}"}
-            await session.commit()
-            await self._publish_state(task)
-            return None
-
-    async def _process_level(
-        self, session: AsyncSession, task: Task, state: _TaskState, level_pos: int
-    ) -> str:
-        level = state.levels[level_pos]
-        todo = [index for index in level if index not in state.results]
-        if not todo:
-            return "ok"
-
-        # Tool-result cache (spec §11: "idempotent read-only calls within
-        # a single task") - `state.tool_cache` lives exactly as long as
-        # this one task. Only `read_only` skills are ever cached (a
-        # `mutating` skill's call is never assumed idempotent, and each
-        # one already pauses for its own individual approval). A cache
-        # hit resolves the step immediately, with no execution at all.
-        # Two-or-more steps sharing the same (skill, args) that are BOTH
-        # still cache misses in this same level are deduplicated here
-        # too (`aliases`) - only the first ("runner") actually calls
-        # `skill.run()`; the rest copy its outcome once it completes,
-        # rather than each racing to miss the cache concurrently.
-        run_plan: dict[int, tuple[Skill, dict[str, Any]]] = {}
-        cache_keys: dict[int, str] = {}
-        runner_for_key: dict[str, int] = {}
-        aliases: dict[int, int] = {}
-
-        for index in todo:
-            step = state.steps[index]
-            resolved_args = resolve_args(step.args, state.results)
-            try:
-                skill = self._skills.get_skill(step.skill_name)
-            except KeyError:
-                skill = await self._synthesize_missing_skill(
-                    session, task, state, index, step, resolved_args
-                )
-                if skill is None:
-                    return "failed"
-
-            # Enforcement layer 2 (see `praxis.core.execution_mode`): a
-            # mutating skill that reached this plan despite layer 1 -
-            # a freshly *synthesized* skill that declared itself
-            # mutating is the real case, since it did not exist when
-            # the Planner's visible set was computed - is refused or
-            # simulated here, at the point of action.
-            if skill.risk == "mutating" and not state.mode.allows_mutation:
-                if state.mode.simulates_mutation:
-                    simulated = {
-                        "simulated": True,
-                        "mode": state.mode.value,
-                        "would_have_called": {"skill": skill.name, "args": resolved_args},
-                        "note": (
-                            "dry run: this mutating step was NOT executed; no external state "
-                            "was changed"
-                        ),
-                    }
-                    _logger.info(
-                        "mutating_step_simulated",
-                        skill=skill.name, step=index, task_id=task.id, mode=state.mode.value,
-                    )
-                    state.results[index] = simulated
-                    self._mark_item(
-                        task, index, status="completed", reason=f"simulated ({state.mode.value})"
-                    )
-                    continue
-
-                error = MutationNotPermittedError(
-                    (
-                        f"step {index} ('{skill.name}') is a mutating skill, which execution "
-                        f"mode '{state.mode.value}' does not permit "
-                        f"({state.mode.describe()})"
-                    ),
-                    mode=state.mode,
-                    skill_name=skill.name,
-                )
-                _logger.warning(
-                    "mutating_step_refused",
-                    skill=skill.name, step=index, task_id=task.id, mode=state.mode.value,
-                )
-                await self._audit.record(
-                    principal=state.principal,
-                    action="task:execute_step",
-                    resource_type="task",
-                    resource_id=task.id,
-                    decision="denied",
-                    reason=str(error),
-                    detail={"step": index, "skill": skill.name, "mode": state.mode.value},
-                    correlation_id=task.correlation_id,
-                )
-                self._mark_item(task, index, status="failed", reason=str(error))
-                task.status = "failed"
-                task.result = {"error": str(error)}
-                await session.commit()
-                await self._publish_state(task)
-                return "failed"
-
-            if should_pause_for_approval(skill):
-                pending = PendingInput(
-                    kind="approval",
-                    detail=(
-                        f"approve mutating skill '{step.skill_name}' "
-                        f"(step {index}) with args {resolved_args}?"
-                    ),
-                )
-                # Create the durable, argument-bound approval record at
-                # pause time, so the exact action+args the operator is
-                # about to be shown is what gets hashed and bound -
-                # not something recomputed later from possibly-drifted
-                # state (`praxis.security.approval`).
-                await create_pending_approval(
-                    session,
-                    request=ApprovalRequest(
-                        task_id=task.id,
-                        step_index=index,
-                        skill_name=step.skill_name,
-                        args=resolved_args,
-                    ),
-                    tenant_id=state.principal.tenant_id,
-                    ttl_seconds=self._approval_ttl,
-                )
-                self._mark_item(task, index, status="awaiting_approval")
-                task.status = "awaiting_approval"
-                task.pending_input = pending.to_dict()
-                await session.commit()
-                await self._publish_state(task)
-                state.paused_index = index
-                state.pending_args[index] = resolved_args
-                return "paused"
-
-            if skill.risk == "read_only":
-                cache_key = _tool_result_cache_key(skill.name, resolved_args)
-                cached_result = await state.tool_cache.get(cache_key)
-                if cached_result is not None:
-                    _logger.info("tool_result_cache_hit", skill=skill.name, step=index, task_id=task.id)
-                    state.results[index] = cached_result
-                    self._merge_known_urls(state, cached_result)
-                    self._mark_item(task, index, status="completed")
-                    await self._record_skill_used(task.id, skill.name, state.principal.tenant_id)
-                    continue
-                if cache_key in runner_for_key:
-                    aliases[index] = runner_for_key[cache_key]
-                    cache_keys[index] = cache_key
-                    continue
-                runner_for_key[cache_key] = index
-                cache_keys[index] = cache_key
-
-            run_plan[index] = (skill, resolved_args)
-
-        for index in run_plan:
-            self._mark_item(task, index, status="in_progress")
-        await session.commit()
-        await self._publish_state(task)
-
-        async def _run_one(index: int) -> tuple[int, Any, BaseException | None]:
-            skill, args = run_plan[index]
-            _logger.info("skill_execution_started", skill=skill.name, step=index, task_id=task.id)
-            try:
-                with start_span("skill.execute", skill=skill.name, step=index):
-                    # `known_urls` (spec §6.1) injected out of band here
-                    # too - see the identical note in
-                    # `resume_after_approval` above.
-                    result = await skill.run(
-                        **args,
-                        known_urls=set(state.known_urls),
-                        tenant_id=state.principal.tenant_id,
-                    )
-                    # Phase 13 (Prompt §8's "output validation"): a
-                    # skill that didn't return what it declared has
-                    # failed, and is reported as a step failure rather
-                    # than silently propagating a result a downstream
-                    # `$n.key` reference will later fail to resolve.
-                    # Matters most for synthesized skills, where the
-                    # implementation is LLM-authored.
-                    result = validate_skill_output(skill.name, skill.outputs, result)
-            except Exception as exc:  # noqa: BLE001 - captured per-step, not swallowed (spec §12)
-                _logger.error(
-                    "skill_execution_failed", skill=skill.name, step=index,
-                    task_id=task.id, error=str(exc),
-                )
-                return index, None, exc
-            _logger.info("skill_execution_completed", skill=skill.name, step=index, task_id=task.id)
-            return index, result, None
-
-        outcomes = await asyncio.gather(*(_run_one(index) for index in run_plan))
-
-        any_failed = False
-        for index, output, exc in outcomes:
-            if exc is not None:
-                self._mark_item(task, index, status="failed", reason=str(exc))
-                any_failed = True
-            else:
-                state.results[index] = output
-                self._merge_known_urls(state, output)
-                self._mark_item(task, index, status="completed")
-                await self._record_skill_used(
-                    task.id, run_plan[index][0].name, state.principal.tenant_id
-                )
-                cache_key = cache_keys.get(index)
-                if cache_key is not None:
-                    await state.tool_cache.set(cache_key, output)
-
-        # Propagate each runner's outcome to every alias sharing its
-        # (skill, args) signature within this same level.
-        for alias_index, runner_index in aliases.items():
-            if runner_index in state.results:
-                state.results[alias_index] = state.results[runner_index]
-                self._merge_known_urls(state, state.results[alias_index])
-                self._mark_item(task, alias_index, status="completed")
-                await self._record_skill_used(
-                    task.id, state.steps[alias_index].skill_name, state.principal.tenant_id
-                )
-            else:
-                reason = next(
-                    (str(exc) for index, _, exc in outcomes if index == runner_index and exc is not None),
-                    "a duplicate step sharing this skill/args failed",
-                )
-                self._mark_item(task, alias_index, status="failed", reason=reason)
-                any_failed = True
-        await session.commit()
-        await self._publish_state(task)
-
-        if any_failed:
-            task.status = "failed"
-            task.result = {"error": "one or more steps failed", "checklist": task.checklist}
-            await session.commit()
-            await self._publish_state(task)
-            return "failed"
-        return "ok"
+        return history

@@ -14,7 +14,16 @@ import uuid
 from datetime import datetime, timezone
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # The one tenant every pre-Phase-12 row is backfilled into, and the one
@@ -195,11 +204,72 @@ class Task(Base):
     # (`praxis.core.execution_mode.ExecutionMode`) - `execute` is the
     # historical behavior and stays the default.
     mode: Mapped[str] = mapped_column(String(16), default="execute")
+    # Phase 21: the materialized plan (list of
+    # `{skill_name, args, depends_on}`). Durable task data, not
+    # ephemeral execution state - which is why it lives here rather
+    # than in the LangGraph checkpoint. Resuming a task in a fresh
+    # process needs the plan to rebuild the same graph; the
+    # checkpoint then supplies how far it got.
+    plan: Mapped[list] = mapped_column(JSON, default=list)
     checklist: Mapped[list] = mapped_column(JSON, default=list)
     pending_input: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class LangGraphCheckpoint(Base):
+    """One LangGraph state snapshot (Phase 21).
+
+    Written by `praxis.core.checkpoint.PraxisCheckpointSaver`, which
+    implements LangGraph's `BaseCheckpointSaver` over this table
+    rather than using its official `AsyncPostgresSaver` - that one
+    requires `psycopg`, whose async mode cannot run on Windows'
+    ProactorEventLoop. Implementing the library's own extension point
+    keeps one driver and one connection pool.
+
+    Retaining every snapshot (rather than upserting one row per task,
+    as the previous hand-rolled checkpointer did) is what makes
+    time-travel and replay possible: `seq` orders them, because
+    checkpoint ids are UUIDs and are not lexically time-ordered.
+    """
+
+    __tablename__ = "langgraph_checkpoints"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    thread_id: Mapped[str] = mapped_column(String(128), index=True)
+    checkpoint_ns: Mapped[str] = mapped_column(String(256), default="")
+    checkpoint_id: Mapped[str] = mapped_column(String(128), index=True)
+    parent_checkpoint_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    checkpoint: Mapped[bytes] = mapped_column(LargeBinary)
+    checkpoint_type: Mapped[str] = mapped_column(String(64), default="json")
+    checkpoint_metadata: Mapped[bytes] = mapped_column(LargeBinary)
+    metadata_type: Mapped[str] = mapped_column(String(64), default="json")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class LangGraphWrite(Base):
+    """Pending channel writes for a partially-completed superstep.
+
+    What lets an interrupted step resume without discarding the work
+    its siblings already finished in the same superstep.
+    """
+
+    __tablename__ = "langgraph_writes"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    thread_id: Mapped[str] = mapped_column(String(128), index=True)
+    checkpoint_ns: Mapped[str] = mapped_column(String(256), default="")
+    checkpoint_id: Mapped[str] = mapped_column(String(128), index=True)
+    task_id: Mapped[str] = mapped_column(String(128))
+    task_path: Mapped[str] = mapped_column(String(256), default="")
+    idx: Mapped[int] = mapped_column(Integer, default=0)
+    channel: Mapped[str] = mapped_column(String(256))
+    value: Mapped[bytes] = mapped_column(LargeBinary)
+    value_type: Mapped[str] = mapped_column(String(64), default="json")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class Attachment(Base):
@@ -254,6 +324,173 @@ class SkillRecord(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     health_status: Mapped[str] = mapped_column(String(32), default="unknown")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class DashboardRecord(Base):
+    """A saved dashboard (Phase 15, Prompt §2's "save the dashboard
+    configuration and allow scheduled refreshes").
+
+    The whole dashboard is stored as one validated `spec` JSON document
+    (`praxis.analytics.dashboard.DashboardSpec`) rather than being
+    shredded across panel/filter/encoding tables. That is deliberate:
+    the spec is a *document* that is always read and written whole, is
+    versioned by `spec_version` so a later release can migrate it, and
+    has no query pattern that would benefit from relational
+    decomposition. Shredding it would buy nothing and make round-trip
+    fidelity - the property that makes a dashboard exportable and
+    diffable - much harder to guarantee.
+    """
+
+    __tablename__ = "dashboards"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    title: Mapped[str] = mapped_column(String(512))
+    description: Mapped[str] = mapped_column(Text, default="")
+    owner_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    spec_version: Mapped[int] = mapped_column(Integer, default=1)
+    spec: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Scheduled-refresh wiring; `None` means this dashboard is only
+    # refreshed on load or on demand.
+    refresh_interval_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class ScheduleRecord(Base):
+    """A user-defined recurring task (Phase 17, Prompt §9).
+
+    Stores `intent_text` rather than a frozen plan deliberately: the
+    plan is produced fresh at each fire time, because the data, the
+    available skills, and the connectors may all have changed since
+    the schedule was created. A frozen plan would go quietly stale.
+
+    `principal_user_id` is a *reference*, never a stored credential -
+    credentials are resolved fresh at fire time so a revoked key stops
+    the schedule at its next run instead of it continuing on a stale
+    copy (see `praxis.agents.schedules`).
+    """
+
+    __tablename__ = "schedules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    name: Mapped[str] = mapped_column(String(256))
+    intent_text: Mapped[str] = mapped_column(Text)
+    principal_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    interval_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cron: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    timezone_name: Mapped[str] = mapped_column(String(64), default="UTC")
+    state: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    overlap_policy: Mapped[str] = mapped_column(String(32), default="skip")
+    missed_run_policy: Mapped[str] = mapped_column(String(32), default="run_once")
+    connector_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class ScheduleRun(Base):
+    """One execution of a schedule.
+
+    `idempotency_key` is unique and derived from
+    `(schedule_id, scheduled_for)`, so two workers racing on the same
+    slot cannot both execute it - deduplication by construction rather
+    than by locking.
+    """
+
+    __tablename__ = "schedule_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    schedule_id: Mapped[str] = mapped_column(String(36), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class DeadLetterEntry(Base):
+    """Failed background work that needs a human (Phase 17, Prompt §9).
+
+    `failures` keeps the WHOLE attempt history, not just the last
+    error: "three timeouts then an auth error" is a materially
+    different diagnosis from "an auth error", and only the history
+    distinguishes them.
+    """
+
+    __tablename__ = "dead_letter"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    job_type: Mapped[str] = mapped_column(String(128), index=True)
+    job_key: Mapped[str] = mapped_column(String(256), index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    failures: Mapped[list] = mapped_column(JSON, default=list)
+    state: Mapped[str] = mapped_column(String(32), default="pending_retry", index=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class MemoryEntry(Base):
+    """One typed, scoped memory (Phase 20, Prompt §5).
+
+    Scope is stored as four nullable columns rather than one opaque
+    blob so it can be *queried* - `praxis.memory.memory_types`
+    turns each into a SQL predicate, which is what makes isolation
+    between users/workspaces/agents real rather than advisory.
+
+    `superseded_by` is what makes correction auditable: updating a
+    memory writes a new row and points the old one at it, so the
+    previous belief stays on record instead of being overwritten.
+    """
+
+    __tablename__ = "memory_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    workspace_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    key: Mapped[str] = mapped_column(String(512), index=True)
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(32), default="agent_inferred")
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    superseded_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, index=True
+    )
 
 
 class HealthRecord(Base):
