@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import structlog
 from docker.errors import DockerException
@@ -30,12 +31,14 @@ from praxis.agents import skill_registry
 from praxis.agents.capability_factory import CapabilityFactory
 from praxis.agents.conversation import ConversationService
 from praxis.agents.planner import Planner
+from praxis.agents.schedule_runner import poll_once
 from praxis.agents.scheduler import Scheduler
 from praxis.agents.subagent import discover_agents
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
 from praxis.connectors.registry import ConnectorRegistry
 from praxis.connectors.sql.sql_connector import SQLConnector
+from praxis.core.dead_letter import DeadLetterQueue
 from praxis.core.exceptions import ApprovalTimeoutError
 from praxis.core.interfaces import HealthStatus
 from praxis.core.orchestrator import Orchestrator
@@ -49,6 +52,7 @@ from praxis.memory.models import HealthRecord, Task
 from praxis.observability.logging import configure_logging
 from praxis.observability.tracing import configure_tracing
 from praxis.sandbox.executor import DockerSandboxExecutor
+from praxis.security.principal import Principal
 from praxis.security.provisioning import ensure_default_tenant
 
 # Observability (spec §10) - configured once, at import time, before
@@ -283,6 +287,72 @@ def _approval_timeout_sweep_job() -> None:
         _logger.exception("approval_timeout_sweep_job_failed")
 
 
+async def run_due_schedules() -> dict[str, int]:
+    """Fires every schedule whose slot has come due.
+
+    The gap this closes: `POST /schedules` persisted a recurring task
+    and `poll_once` knew how to find due ones, but nothing in the
+    shipped application ever called it. A user could create a weekly
+    report and it would simply never run - persistence without a worker
+    is a configuration screen, not a feature.
+
+    The launcher is supplied here rather than inside the poller because
+    only the application knows how to start real work. It runs each due
+    schedule as its own task under the schedule's own stored identity,
+    so a recurring job executes with the tenant that created it and not
+    with system rights.
+
+    Failures go to the dead-letter queue rather than a log line: a
+    schedule fires with nobody watching, so "the Monday report did not
+    run" has to be discoverable on Tuesday and retryable.
+    """
+    settings = Settings()
+    store = PostgresStore(settings)
+    orchestrator = _get_orchestrator()
+    dead_letters = DeadLetterQueue(store)
+
+    async def _launch(schedule: Any, scheduled_for: datetime) -> str:
+        # The schedule's own principal, reconstructed from what was
+        # stored when it was created. Deliberately NOT the system
+        # principal: a recurring task must not quietly acquire more
+        # rights than the person who scheduled it.
+        principal = Principal(
+            tenant_id=schedule.tenant_id,
+            user_id=schedule.principal_user_id,
+            email="",
+            roles=("analyst",),
+        )
+        return await orchestrator.start_task(
+            schedule.intent_text,
+            connector_name=schedule.connector_name,
+            principal=principal,
+        )
+
+    try:
+        async with store.session() as session:
+            result = await poll_once(session, _launch, dead_letters=dead_letters)
+    finally:
+        await store.dispose()
+
+    if result.started_count:
+        _logger.info(
+            "schedules_fired",
+            started=result.started_count,
+            skipped=result.skipped_count,
+        )
+    return {"started": result.started_count, "skipped": result.skipped_count}
+
+
+def _schedule_poll_job() -> None:
+    # Same sync-callable bridge as the health scan above, and the same
+    # reason for swallowing: a failure here must not take the
+    # scheduler's worker thread down and silently stop every other job.
+    try:
+        asyncio.run(run_due_schedules())
+    except Exception:  # noqa: BLE001
+        _logger.exception("schedule_poll_job_failed")
+
+
 def _build_scheduler() -> Scheduler | None:
     """Genuinely optional, degrades gracefully - same posture as
     `_build_connector_registry` above: `Settings()` can fail (e.g.
@@ -302,6 +372,11 @@ def _build_scheduler() -> Scheduler | None:
         _approval_timeout_sweep_job,
         settings.approval_timeout_seconds,
         job_id="approval_timeout_sweep",
+    )
+    scheduler.add_interval_job(
+        _schedule_poll_job,
+        settings.schedule_poll_interval_seconds,
+        job_id="schedule_poll",
     )
     scheduler.start()
     return scheduler

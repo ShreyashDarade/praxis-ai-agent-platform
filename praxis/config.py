@@ -54,6 +54,15 @@ class Settings(BaseSettings):
     # `praxis.api.main`'s module-level setup.
     health_scan_interval_seconds: int = Field(default=300, ge=1)
 
+    # How often the application looks for due user schedules
+    # (`praxis.api.main.run_due_schedules`). Sixty seconds is a
+    # deliberate floor on granularity: a schedule is due at a
+    # minute boundary at finest, so polling faster only costs
+    # queries. Due-ness lives in a column, so a poll missed
+    # during a restart is picked up by the next one rather than
+    # being lost.
+    schedule_poll_interval_seconds: int = Field(default=60, ge=1)
+
     # Phase 12 (Multi-tenancy, identity, RBAC/ABAC - Prompt §8, §11).
     # Off by default so a single-operator deployment (and this repo's
     # own test suite) keeps working exactly as before: with auth
