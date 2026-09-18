@@ -113,8 +113,15 @@ _SCHEMA_CACHE_TTL_SECONDS = scopes.ttl_for(scopes.CONNECTOR_SCHEMA)
 # fence - which reads as a malformed response (spec-honest: fed back as
 # a real parse-error attempt, exactly like any other failure - never
 # silently retried with no explanation), but is really just running out
-# of room, not the model failing the task. Generous on purpose.
-_MAX_RESPONSE_TOKENS = 8192
+# of room, not the model failing the task.
+#
+# `None` means uncapped, which is now the honest setting rather than a
+# generous guess. Synthesis is the most reasoning-heavy call this
+# system makes, and on a reasoning model (gpt-5, o-series) the cap
+# covers thinking as well as the emitted code - so any fixed number
+# here is a number that truncates some legitimate synthesis, and the
+# symptom is a malformed-response retry loop that never converges.
+_MAX_RESPONSE_TOKENS = None
 
 # The one signal (spec §12/§19/§20: exit code alone is not enough - "a
 # script that prints nothing meaningful" must never pass) that a

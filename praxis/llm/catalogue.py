@@ -38,13 +38,12 @@ from __future__ import annotations
 
 from typing import Any
 
-import anthropic
-
 from praxis.agents.budget import BudgetTracker
 from praxis.cache import scopes
 from praxis.cache.keys import CacheKey
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.core.interfaces import Cache
+from praxis.llm import providers
 from praxis.observability.metrics import (
     LLM_LATENCY,
     metrics,
@@ -99,7 +98,7 @@ def _cache_key(
     purpose: str,
     model: str,
     prompt: str,
-    max_tokens: int,
+    max_tokens: int | None,
     kwargs: dict[str, Any],
     principal: Principal | None = None,
 ) -> CacheKey:
@@ -122,6 +121,23 @@ def _cache_key(
     )
 
 
+def _configured_overrides() -> dict[str, str]:
+    """`Settings.llm_model_overrides`, or nothing if unreadable.
+
+    Never raises. `LLMCatalogue()` is constructed in six places
+    including at import time, and several of them predate `Settings`
+    being constructible in that context; a deployment with no database
+    URL configured must still be able to build a catalogue with its
+    defaults rather than fail on an unrelated missing setting.
+    """
+    try:
+        from praxis.config import Settings
+
+        return dict(Settings().llm_model_overrides)
+    except Exception:  # noqa: BLE001 - see docstring
+        return {}
+
+
 class LLMCatalogue:
     """Maps a purpose string to a model id, and runs completions against it."""
 
@@ -133,9 +149,17 @@ class LLMCatalogue:
         cache_ttl_seconds: int | None = DEFAULT_CACHE_TTL_SECONDS,
         budget: BudgetTracker | None = None,
     ) -> None:
-        self._model_mapping: dict[str, str] = (
-            dict(model_mapping) if model_mapping is not None else dict(DEFAULT_MODEL_MAPPING)
-        )
+        # An explicit mapping wins outright (a test forcing every
+        # purpose onto one model must not have deployment config
+        # quietly reintroduced underneath it). Otherwise the defaults
+        # are taken and `Settings.llm_model_overrides` applied on top,
+        # which is how a deployment moves one purpose to another
+        # provider without touching code.
+        if model_mapping is not None:
+            self._model_mapping: dict[str, str] = dict(model_mapping)
+        else:
+            self._model_mapping = dict(DEFAULT_MODEL_MAPPING)
+            self._model_mapping.update(_configured_overrides())
         self._cache: Cache = cache if cache is not None else InMemoryCache()
         self._cache_ttl_seconds = cache_ttl_seconds
         # Phase 14: optional, so every existing caller is unbudgeted
@@ -168,18 +192,25 @@ class LLMCatalogue:
         **kwargs)` - and the same tenant and effective permissions,
         when a `principal` is supplied - within the cache's TTL returns
         the cached response text: no client is constructed and no API
-        call is made at all on a cache hit. On a miss, constructs a
-        fresh `anthropic.AsyncAnthropic()` client with no `api_key`
-        kwarg - the SDK reads `ANTHROPIC_API_KEY` from the environment
-        by default - and caches the concatenated text of every text
-        content block in the response before returning it.
+        call is made at all on a cache hit. On a miss, the call is
+        dispatched by `praxis.llm.providers` to whichever provider the
+        model id belongs to, each SDK reading its own key from the
+        environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), and the
+        response text is cached before it is returned.
 
         `principal` is keyword-only and is never forwarded to the
         provider: it identifies who is asking, which decides which
         cache entry may be read, not what the model is asked.
         """
         model = self.model_for(purpose)
-        max_tokens = kwargs.pop("max_tokens", 1024)
+        # `None` means uncapped, and it is the default deliberately.
+        # The previous default of 1024 silently truncated: on a
+        # reasoning model the cap covers thinking as well as the
+        # reply, so a long planning prompt spent the whole allowance
+        # reasoning and returned an empty string, which surfaced two
+        # layers away as an unparseable plan. A caller that genuinely
+        # wants a short answer still passes `max_tokens`.
+        max_tokens = kwargs.pop("max_tokens", None)
         cache_key = _cache_key(purpose, model, prompt, max_tokens, kwargs, principal)
 
         cached = await self._cache.get(cache_key.value)
@@ -200,24 +231,24 @@ class LLMCatalogue:
         if self._budget is not None:
             self._budget.check_llm_call(model, estimated_tokens=_estimate_tokens(prompt))
 
-        client = anthropic.AsyncAnthropic()
+        # Which provider serves this model is derived from the model
+        # id (`praxis.llm.providers`), so a purpose can be pointed at
+        # an OpenAI model with no code change - which is what the
+        # "swapping providers is a config change" promise at the top
+        # of this module actually requires.
         self.real_api_calls += 1
         with metrics.time(LLM_LATENCY, {"model": model, "purpose": purpose}):
-            response = await client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-                **kwargs,
+            completion = await providers.complete(
+                model, prompt, max_tokens=max_tokens, **kwargs
             )
-        text = "".join(block.text for block in response.content if block.type == "text")
+        text = completion.text
 
         # Phase 17: real token and cost accounting, read off the
         # provider's own usage report rather than estimated - an
         # estimate would make the cost guardrail systematically wrong
         # in whichever direction the estimator is biased.
-        usage = getattr(response, "usage", None)
-        tokens_in = int(getattr(usage, "input_tokens", 0) or 0)
-        tokens_out = int(getattr(usage, "output_tokens", 0) or 0)
+        tokens_in = completion.tokens_in
+        tokens_out = completion.tokens_out
         cost_usd = 0.0
         if self._budget is not None:
             cost_usd = self._budget.record_llm_call(model, tokens_in, tokens_out)

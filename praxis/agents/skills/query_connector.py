@@ -73,7 +73,14 @@ class QueryConnectorSkill(Skill):
             "messaging connector - e.g. a PromQL expression for a Prometheus "
             "connector, or a channel id for Slack. NOT for a connector needing "
             "bespoke, schema-aware SQL against an arbitrary customer database - "
-            "a dedicated capability should be synthesized for that instead."
+            "a dedicated capability should be synthesized for that instead. "
+            "For an MCP connector this is the TOOL NAME, and the tool's own "
+            "arguments go in `params`."
+        ),
+        "params": (
+            "optional object of argument names to values for connectors whose "
+            "query is a named call - an MCP tool's own arguments, for example "
+            "{\"text\": \"hello\"}. Omit for query-string connectors."
         ),
     }
     outputs = {"result": "the connector's raw read() result for this query"}
@@ -81,10 +88,26 @@ class QueryConnectorSkill(Skill):
     async def run(self, **kwargs: Any) -> Any:
         connector_name = kwargs["connector_name"]
         query = kwargs["query"]
+        # Arguments for connectors whose "query" is a named call rather
+        # than a query string - an MCP tool above all, where `query` is
+        # the tool name and the arguments are a separate object.
+        #
+        # Without this an MCP tool taking any argument was unreachable
+        # through this skill, so a planner asked to call one had no
+        # choice but to invent a new capability and have it synthesized:
+        # generating code to do something a registered tool already
+        # does, which is exactly the outcome the brief's "prefer reuse"
+        # ordering exists to avoid.
+        params = kwargs.get("params") or {}
+        if not isinstance(params, dict):
+            raise ValueError(
+                "'params' must be an object of argument names to values, got "
+                f"{type(params).__name__}"
+            )
 
         registry = build_registry(Settings())
         connector = registry.get(connector_name)  # KeyError is already clear/typed (spec §12)
-        result = await connector.read(query)
+        result = await connector.read(query, **params)
         return {"result": result}
 
 

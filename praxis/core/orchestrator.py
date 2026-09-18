@@ -51,7 +51,9 @@ error before anything runs.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
+import inspect
 import json
 import re
 from dataclasses import dataclass, field
@@ -64,6 +66,7 @@ from sqlalchemy import select
 from praxis.agents.planner import Planner
 from praxis.agents.publication import SkillStatus
 from praxis.agents.skill import Skill
+from praxis.agents.skills.delegate import release_delegation_state
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.config import Settings
 from praxis.core.checkpoint import PraxisCheckpointSaver
@@ -83,7 +86,7 @@ from praxis.core.graph_engine import build_task_graph
 from praxis.core.interfaces import Connector, GraphStore
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
 from praxis.memory.db import PostgresStore
-from praxis.memory.memory_types import MemoryScope, MemoryStore
+from praxis.memory.memory_types import MemoryKind, MemoryScope, MemoryStore
 from praxis.memory.models import SkillRecord, Task
 from praxis.observability.logging import bind_correlation_id
 from praxis.observability.tracing import start_span
@@ -110,6 +113,10 @@ _URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
 
 # A task in one of these will never transition again.
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+# Spelled out because the failure summary below is assembled from
+# several pieces and reads more clearly joined than embedded.
+NEWLINE = chr(10)
 
 
 def _extract_urls(text: str) -> set[str]:
@@ -176,6 +183,20 @@ class _TaskContext:
     # one.
     in_flight: dict[str, asyncio.Future] = field(default_factory=dict)
     cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class _AttemptOutcome:
+    """What one plan-and-execute pass produced.
+
+    `failure_text` is what a retry is given: the plan that was tried
+    and the errors it produced, formatted for a planner to read. Empty
+    when nothing failed.
+    """
+
+    status: str
+    failure_text: str
+    correlation_id: str
 
 
 def _expected_output_keys(all_steps: list[PlanStep], step_index: int) -> set[str]:
@@ -245,6 +266,7 @@ class Orchestrator:
         approval_ttl_seconds: int | None = None,
         checkpointer: Any | None = None,
         retain_checkpoints: bool | None = None,
+        max_replan_attempts: int | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
@@ -262,7 +284,74 @@ class Orchestrator:
             checkpointer if checkpointer is not None else PraxisCheckpointSaver(store)
         )
         self._retain_checkpoints = retain_checkpoints
+        self._max_replan_attempts_override = max_replan_attempts
         self._contexts: dict[str, _TaskContext] = {}
+
+    @functools.cached_property
+    def _planner_accepts_prior_failures(self) -> bool:
+        """Whether this planner can be shown why the last attempt failed.
+
+        `Planner.plan` grew a `prior_failures` argument when re-planning
+        was added, but the orchestrator accepts *any* object with a
+        `plan` method - an alternative planner, or a test double - and
+        several predate the argument. Passing it unconditionally turned
+        every such planner's first call into a `TypeError`, which then
+        surfaced as "planning failed" rather than as the incompatibility
+        it actually was.
+
+        So it is passed only when it is both supported and non-empty,
+        and a planner without it simply does not re-plan: re-planning
+        blind would re-run the same inputs through the same planner and
+        get the same plan, spending a model call to reproduce the
+        failure.
+        """
+        try:
+            signature = inspect.signature(self._planner.plan)
+        except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
+            return False
+        parameters = signature.parameters
+        return "prior_failures" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    @functools.cached_property
+    def _planner_accepts_prior_episodes(self) -> bool:
+        """Whether this planner can be shown what similar past runs did.
+
+        Probed for the same reason as
+        `_planner_accepts_prior_failures`: the orchestrator accepts any
+        object with a `plan` method, and an alternative planner that
+        predates episodic recall must keep working rather than fail on
+        an argument it never declared.
+        """
+        try:
+            signature = inspect.signature(self._planner.plan)
+        except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
+            return False
+        parameters = signature.parameters
+        return "prior_episodes" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    @property
+    def _max_replan_attempts(self) -> int:
+        """How many times a failed plan may be corrected and retried.
+
+        Bounded, and deliberately small. Each retry is a real model call
+        against the same intent; a plan that is still failing on the
+        third attempt is usually failing for a reason more attempts
+        cannot fix (a missing credential, an absent data source), and
+        spending more calls on it turns one clear failure into an
+        expensive one.
+        """
+        if self._max_replan_attempts_override is not None:
+            return self._max_replan_attempts_override
+        try:
+            return int(Settings().max_replan_attempts)
+        except Exception:  # noqa: BLE001 - unconfigured falls back to the default
+            return 2
 
     @property
     def _retains_checkpoints(self) -> bool:
@@ -288,6 +377,11 @@ class Orchestrator:
         """Drops a terminal task's in-memory context, and its checkpoints
         only when history is not being retained."""
         self._contexts.pop(task_id, None)
+        # The delegation tree is per-task and lives at module scope in
+        # the delegate skill (it cannot be carried on `_TaskContext`,
+        # which a skill never sees). Dropping it here is what stops a
+        # long-lived process accumulating one node per delegation.
+        release_delegation_state(task_id)
         if not self._retains_checkpoints:
             await self._checkpointer.adelete_thread(task_id)
 
@@ -668,6 +762,12 @@ class Orchestrator:
                         **resolved_args,
                         known_urls=set(known_urls),
                         tenant_id=context.principal.tenant_id,
+                        # Every `Skill.run` takes `**kwargs`, so this is
+                        # additive. `delegate_to_specialist` needs it to
+                        # anchor its delegation tree to the parent task,
+                        # which is what makes depth and fan-out limits
+                        # count the whole tree rather than one step.
+                        task_id=task_id,
                     )
                 output = validate_skill_output(skill.name, skill.outputs, output)
             except Exception as exc:  # noqa: BLE001 - a step's failure, not swallowed (spec §12)
@@ -964,7 +1064,119 @@ class Orchestrator:
     async def drive_task(
         self, task_id: str, *, principal: Principal = SYSTEM_PRINCIPAL
     ) -> str:
-        """Plans and executes an already-created task.
+        """Plans and executes a task, correcting itself if it fails.
+
+        A first plan is frequently wrong in a way the failure itself
+        explains - a query against a column that does not exist comes
+        back naming the columns that do. Stopping there turns a
+        recoverable mistake into a non-answer, so a failed attempt is
+        fed back to the planner and retried, bounded by
+        `Settings.max_replan_attempts`.
+
+        What is deliberately NOT retried:
+
+        - a task that PAUSED for approval, which has not failed and is
+          waiting on a person;
+        - a task that was cancelled, where retrying would override the
+          decision to stop;
+        - a plan that produced the same failure twice, which is a sign
+          the model is not learning from the error rather than a reason
+          to spend another attempt on it;
+        - a planner that cannot be told what went wrong (see
+          `_planner_accepts_prior_failures`), because re-planning blind
+          reproduces the identical plan by construction.
+        """
+        attempt = 0
+        prior_failures = ""
+        while True:
+            outcome = await self._drive_attempt(
+                task_id, principal=principal, prior_failures=prior_failures
+            )
+            attempt += 1
+            if outcome.status != "failed" or attempt > self._max_replan_attempts:
+                return task_id
+            if not self._planner_accepts_prior_failures:
+                with bind_correlation_id(outcome.correlation_id):
+                    _logger.info(
+                        "task_replan_unavailable_planner_cannot_see_failures",
+                        task_id=task_id,
+                        planner=type(self._planner).__name__,
+                    )
+                return task_id
+            if outcome.failure_text and outcome.failure_text == prior_failures:
+                # The same plan failed the same way. Another attempt
+                # would spend a model call to learn nothing.
+                with bind_correlation_id(outcome.correlation_id):
+                    _logger.info(
+                        "task_replan_abandoned_repeat_failure",
+                        task_id=task_id,
+                        attempt=attempt,
+                    )
+                return task_id
+            prior_failures = outcome.failure_text
+
+            # The failed attempt's graph state must not be resumed.
+            #
+            # LangGraph keys a checkpoint by thread, and the thread is
+            # the task id, so without this the retry picked up exactly
+            # where the failure left off - carrying the old `errors`
+            # channel forward, which then settled the task as failed
+            # even though the corrected plan had just succeeded. A
+            # re-plan is a new execution of a new plan, so it starts
+            # from nothing.
+            await self._checkpointer.adelete_thread(task_id)
+            self._contexts.pop(task_id, None)
+
+            with bind_correlation_id(outcome.correlation_id):
+                _logger.info(
+                    "task_replanning_after_failure",
+                    task_id=task_id,
+                    attempt=attempt,
+                    max_attempts=self._max_replan_attempts,
+                )
+
+
+    async def _outcome(self, task_id: str) -> _AttemptOutcome:
+        """Reads back what one attempt actually produced.
+
+        From the row rather than from in-memory state, because that is
+        what a retry has to reason about and what survives a restart.
+        """
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+        if task is None:
+            return _AttemptOutcome(status="failed", failure_text="", correlation_id="")
+
+        result = task.result or {}
+        errors = [str(e) for e in (result.get("errors") or [])]
+        plan = task.plan or []
+        failure_text = ""
+        if errors:
+            attempted = NEWLINE.join(
+                f"  step {i}: {entry.get('skill_name')}({entry.get('args')})"
+                for i, entry in enumerate(plan)
+            )
+            failure_text = (
+                "The plan that was tried:" + NEWLINE
+                + (attempted or "  (no plan was produced)")
+                + NEWLINE + NEWLINE + "What went wrong:" + NEWLINE
+                + NEWLINE.join(f"  - {e}" for e in errors)
+            )
+        return _AttemptOutcome(
+            status=task.status,
+            failure_text=failure_text,
+            correlation_id=task.correlation_id,
+        )
+
+
+    async def _drive_attempt(
+        self,
+        task_id: str,
+        *,
+        principal: Principal = SYSTEM_PRINCIPAL,
+        prior_failures: str = "",
+    ) -> _AttemptOutcome:
+        """One plan-and-execute pass.
 
         `principal` is passed rather than reconstructed: the row records
         a tenant and a user id but not the roles, and rebuilding a
@@ -998,7 +1210,7 @@ class Orchestrator:
                         task_id=task_id, connector_name=connector_name, error=message,
                     )
                 await self._fail_task(task_id, message, checklist=[])
-                return task_id
+                return await self._outcome(task_id)
             try:
                 connector = self._connector_registry.get(connector_name)
             except KeyError as exc:
@@ -1010,19 +1222,31 @@ class Orchestrator:
                 await self._fail_task(
                     task_id, f"unknown connector '{connector_name}': {exc}", checklist=[]
                 )
-                return task_id
+                return await self._outcome(task_id)
 
         try:
             # Enforcement layer 1: under any mode that cannot mutate,
             # the Planner is never shown a mutating skill.
+            # `prior_failures` is passed only on a retry, and only to a
+            # planner that declares it: see
+            # `_planner_accepts_prior_failures`. A first attempt calls
+            # exactly the signature every planner has always had.
+            plan_kwargs: dict[str, Any] = {"connector": connector}
+            if prior_failures and self._planner_accepts_prior_failures:
+                plan_kwargs["prior_failures"] = prior_failures
+            recalled = await self._recall_episodes(intent_text, principal)
+            if recalled and self._planner_accepts_prior_episodes:
+                plan_kwargs["prior_episodes"] = recalled
             steps = await self._planner.plan(
-                intent_text, visible_skills(self._skills.all_skills(), mode), connector=connector
+                intent_text,
+                visible_skills(self._skills.all_skills(), mode),
+                **plan_kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - a planning failure fails the task
             with bind_correlation_id(correlation_id):
                 _logger.error("task_planning_failed", task_id=task_id, error=str(exc))
             await self._fail_task(task_id, f"planning failed: {exc}", checklist=[])
-            return task_id
+            return await self._outcome(task_id)
 
         checklist = [
             {"content": _describe_step(step), "status": "pending", "reason": None}
@@ -1037,7 +1261,7 @@ class Orchestrator:
             compute_levels(steps)
         except ValueError as exc:
             await self._fail_task(task_id, f"invalid plan: {exc}", checklist=checklist)
-            return task_id
+            return await self._outcome(task_id)
 
         # `plan_only`: the plan IS the deliverable.
         if not mode.allows_execution:
@@ -1070,7 +1294,7 @@ class Orchestrator:
             await self._publish_state(stored)
             with bind_correlation_id(correlation_id):
                 _logger.info("task_plan_only_completed", task_id=task_id, steps=len(steps))
-            return task_id
+            return await self._outcome(task_id)
 
         async with self._store.session() as session:
             stored = await session.get(Task, task_id)
@@ -1100,7 +1324,7 @@ class Orchestrator:
                 "errors": [],
             },
         )
-        return task_id
+        return await self._outcome(task_id)
 
 
     async def start_task(
@@ -1205,6 +1429,53 @@ class Orchestrator:
         # makes `replay_history` a post-hoc debugging tool rather than
         # one that only works while a task is still running.
         await self._release_thread(task_id)
+
+    async def _recall_episodes(
+        self, intent_text: str, principal: Principal, *, limit: int = 5
+    ) -> str:
+        """What this deployment already knows about answering this intent.
+
+        Matched on the intent itself, which is how
+        `MemoryStore.record_episode` keys an episode - so this returns
+        the previous runs of *this* question, including superseded
+        ones, newest first. That is a narrower claim than "similar
+        intents": matching similar-but-different wording would need
+        embeddings, and a near-miss presented as precedent is worse
+        than no precedent at all.
+
+        Scoped to the running principal, so one tenant never sees
+        another's history.
+
+        Never raises. Recall is an enrichment to planning; a task must
+        not fail because its own history could not be read.
+        """
+        try:
+            memories = MemoryStore(self._store)
+            episodes = await memories.history(
+                scope=MemoryScope(
+                    tenant_id=principal.tenant_id, user_id=principal.user_id
+                ),
+                kind=MemoryKind.EPISODIC,
+                key=f"episode:{intent_text[:180]}",
+            )
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            _logger.warning("episode_recall_failed", error=str(exc))
+            return ""
+
+        if not episodes:
+            return ""
+
+        lines: list[str] = []
+        for episode in episodes[:limit]:
+            value = episode.value if isinstance(episode.value, dict) else {}
+            detail = episode.detail if isinstance(episode.detail, dict) else {}
+            skills = detail.get("skills") or []
+            lines.append(
+                f"- [{value.get('outcome', 'unknown')}] {value.get('summary', '')}"
+                + (f" (skills used: {', '.join(map(str, skills))})" if skills else "")
+            )
+        _logger.info("episodes_recalled", count=len(lines))
+        return NEWLINE.join(lines)
 
     async def _record_episode(
         self, task: Task, context: _TaskContext, errors: list[str]

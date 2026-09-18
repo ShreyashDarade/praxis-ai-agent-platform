@@ -128,6 +128,21 @@ class Settings(BaseSettings):
     # accumulate, roughly one per superstep per task, so a deployment
     # running many short tasks should either set this False or prune on
     # a schedule via `Orchestrator.prune_task_history`.
+    # How many times a failed plan is corrected and retried before the
+    # task is reported as failed.
+    #
+    # A first plan is often wrong in a way the failure itself explains -
+    # a query against a column that does not exist comes back naming the
+    # columns that do - and stopping there turns a recoverable mistake
+    # into a non-answer. Bounded because each retry is a real model call:
+    # a plan still failing on the third attempt is usually blocked by
+    # something more attempts cannot fix.
+    max_replan_attempts: int = Field(
+        default=2,
+        ge=0,
+        description="Times a failed plan may be re-planned with the failure as context",
+    )
+
     retain_checkpoints_after_completion: bool = Field(
         default=True,
         description="Keep a finished task's checkpoints so its run stays replayable",
@@ -455,4 +470,23 @@ class Settings(BaseSettings):
     mcp_servers: list[MCPServerConfig] = Field(
         default_factory=list,
         description="MCP servers to register as connectors; see MCPServerConfig",
+    )
+
+    # Which model serves which purpose. Empty means the catalogue's own
+    # defaults; any key given here replaces one of them.
+    #
+    # This is what makes `praxis.llm.catalogue`'s "swapping providers is
+    # a config change" literally true rather than aspirational: the
+    # provider is derived from the model id, so pointing "planning" at
+    # "gpt-5" moves planning to OpenAI with no code change and nothing
+    # else to keep in sync. Overrides rather than a whole mapping, so a
+    # deployment moving one purpose does not have to restate the others
+    # and silently miss a new one added later.
+    llm_model_overrides: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            'JSON object of LLM purpose to model id, e.g. {"planning": "gpt-5"}. '
+            "Model ids beginning 'claude-' route to Anthropic, 'gpt-'/'o1'/'o3'/'o4' "
+            "to OpenAI."
+        ),
     )

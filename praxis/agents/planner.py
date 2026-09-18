@@ -44,7 +44,7 @@ from praxis.llm.catalogue import LLMCatalogue
 from praxis.llm.prompt_manager import PromptManager
 
 _PLAN_PROMPT_NAME = "plan_intent"
-_PLAN_PROMPT_VERSION = "v2"
+_PLAN_PROMPT_VERSION = "v3"
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
 
@@ -112,6 +112,8 @@ class Planner:
         available_skills: list[Skill],
         *,
         connector: Connector | None = None,
+        prior_failures: str = "",
+        prior_episodes: str = "",
     ) -> list[PlanStep]:
         # inputs/outputs are formatted to a plain string here, in Python,
         # rather than with a nested {% for %} inside the template: Jinja's
@@ -142,6 +144,15 @@ class Planner:
             _PLAN_PROMPT_VERSION,
             intent_text=intent_text,
             connector_schema=connector_schema_text,
+            # What a previous attempt tried and how it failed. Empty on
+            # the first attempt; on a retry it is the difference between
+            # guessing again and correcting a known mistake.
+            prior_failures=prior_failures,
+            # What this deployment already learned from answering
+            # similar intents. Written on every task by
+            # `Orchestrator._record_episode`; until now nothing read it
+            # back, which made episodic memory write-only.
+            prior_episodes=prior_episodes,
             skills=[
                 {
                     "name": skill.name,

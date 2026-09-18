@@ -502,11 +502,14 @@ def get_conversation_service() -> ConversationService:
 # as "build the shared wiring, then mount the routes on top of it".
 from praxis.api.routes import (  # noqa: E402
     admin,
+    agents,
     attachments,
     conversations,
     dashboards,
     health,
+    memory,
     schedules,
+    semantic,
     skills,
     tasks,
 )
@@ -519,6 +522,9 @@ app.include_router(dashboards.router)
 app.include_router(schedules.router)
 app.include_router(conversations.router)
 app.include_router(skills.router)
+app.include_router(agents.router)
+app.include_router(memory.router)
+app.include_router(semantic.router)
 
 
 async def _bootstrap_default_tenant() -> None:

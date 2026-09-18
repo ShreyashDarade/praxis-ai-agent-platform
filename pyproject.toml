@@ -50,6 +50,12 @@ dependencies = [
     # new major line (the SDK's own httpx2-based transport) - capped
     # below 2.0 until a deliberate migration.
     "anthropic>=1.6,<2.0",
+    # The second provider `praxis.llm.providers` routes to. A hard
+    # dependency rather than an optional extra: `LLMCatalogue` picks a
+    # provider from the model id at run time, so a deployment that
+    # points a purpose at "gpt-5" must not discover at the first
+    # planning call that the SDK was never installed.
+    "openai>=1.40,<4.0",
     # Jinja2 was already present transitively (via spacy/torch) but is
     # now a direct dependency of PromptManager - declared explicitly at
     # the version already installed and verified working.
