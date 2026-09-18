@@ -17,16 +17,26 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from praxis.api import main
+from praxis.api.dependencies import authorize_resource, require
 from praxis.config import Settings
 from praxis.core.events import task_event_bus, task_state_snapshot
+from praxis.core.execution_mode import ExecutionMode
 from praxis.memory.db import PostgresStore
 from praxis.memory.models import Task
+from praxis.security.approval import ApprovalBindingError, ApprovalExpiredError
+from praxis.security.authentication import (
+    AuthenticationError,
+    authenticate_api_key,
+    extract_credential,
+)
+from praxis.security.policy import Permission
+from praxis.security.principal import SYSTEM_PRINCIPAL, Principal
 
 router = APIRouter()
 
@@ -38,6 +48,13 @@ class IntentRequest(BaseModel):
     # `Orchestrator.start_task`'s own `connector_name` (see its
     # docstring for resolution/failure semantics).
     connector: str | None = None
+    # Phase 13: which execution mode to run under. `execute` (the
+    # default) is the historical behavior. `plan_only` stops after
+    # planning; `dry_run` simulates without side effects; `read_only`
+    # removes every mutating skill from the plan's reachable set
+    # entirely (Prompt §8: "Plan mode must remove or deny mutating
+    # tools, not merely tell the model not to use them").
+    mode: ExecutionMode = ExecutionMode.EXECUTE
 
 
 class ApproveRequest(BaseModel):
@@ -49,10 +66,18 @@ class ClarifyRequest(BaseModel):
 
 
 @router.post("/intent", status_code=201)
-async def create_intent(body: IntentRequest) -> dict[str, Any]:
+async def create_intent(
+    body: IntentRequest,
+    principal: Annotated[Principal, Depends(require(Permission.TASK_CREATE))],
+) -> dict[str, Any]:
     """Ad-hoc ask -> a new `Task`, run through the Orchestrator (spec §14)."""
     orchestrator = main._get_orchestrator()
-    task_id = await orchestrator.start_task(body.text, connector_name=body.connector)
+    task_id = await orchestrator.start_task(
+        body.text,
+        connector_name=body.connector,
+        principal=principal,
+        mode=body.mode,
+    )
     return {"task_id": task_id}
 
 
@@ -115,15 +140,27 @@ async def webhook_alert(request: Request) -> dict[str, Any]:
     summary = annotations.get("summary") or annotations.get("description") or "no summary provided"
     intent_text = f"Investigate alert '{alertname}': {summary}"
 
+    # Runs as the system principal in the default tenant: an inbound
+    # Alertmanager webhook carries no user identity by design (it is a
+    # machine-to-machine trigger, authenticated at the network/ingress
+    # layer). Attributing it to a real user would be a lie in the audit
+    # trail; attributing it to `system` is the truth.
     orchestrator = main._get_orchestrator()
-    task_id = await orchestrator.start_task(intent_text)
+    task_id = await orchestrator.start_task(intent_text, principal=SYSTEM_PRINCIPAL)
     return {"task_id": task_id}
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str) -> dict[str, Any]:
+async def get_task(
+    task_id: str,
+    principal: Annotated[Principal, Depends(require(Permission.TASK_READ))],
+) -> dict[str, Any]:
     """Task status/result, including the live checklist and any pending
-    approval/clarification detail (spec §7, §9, §14)."""
+    approval/clarification detail (spec §7, §9, §14).
+
+    Tenant-isolated: a task belonging to another tenant is reported as
+    404, never 403 (see `authorize_resource`'s own note on why).
+    """
     settings = Settings()
     store = PostgresStore(settings)
     try:
@@ -135,8 +172,17 @@ async def get_task(task_id: str) -> dict[str, Any]:
     if task is None:
         raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
 
+    await authorize_resource(
+        principal,
+        Permission.TASK_READ,
+        resource_type="task",
+        resource_id=task_id,
+        resource_tenant_id=task.tenant_id,
+    )
+
     return {
         "status": task.status,
+        "mode": task.mode,
         "checklist": task.checklist,
         "pending_input": task.pending_input,
         "result": task.result,
@@ -144,13 +190,51 @@ async def get_task(task_id: str) -> dict[str, Any]:
 
 
 @router.post("/tasks/{task_id}/approve")
-async def approve_task(task_id: str, body: ApproveRequest) -> dict[str, Any]:
-    """Resumes a mutating task paused on approval (spec §8, §14 - the interrupt)."""
+async def approve_task(
+    task_id: str,
+    body: ApproveRequest,
+    principal: Annotated[Principal, Depends(require(Permission.TASK_APPROVE))],
+) -> dict[str, Any]:
+    """Resumes a mutating task paused on approval (spec §8, §14 - the interrupt).
+
+    The decision is recorded as an identity-bound `ApprovalRecord`
+    (approver, tenant, exact action+args hash, expiry, idempotency key -
+    `praxis.security.approval`) *before* anything executes, and the
+    orchestrator re-verifies that binding against the args it is about
+    to run. A replayed call resolves to the same record rather than
+    authorizing a second execution.
+    """
+    settings = Settings()
+    store = PostgresStore(settings)
+    try:
+        async with store.session() as session:
+            task = await session.get(Task, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
+        await authorize_resource(
+            principal,
+            Permission.TASK_APPROVE,
+            resource_type="task",
+            resource_id=task_id,
+            resource_tenant_id=task.tenant_id,
+        )
+    finally:
+        await store.dispose()
+
     orchestrator = main._get_orchestrator()
     try:
-        await orchestrator.resume_after_approval(task_id, body.approved)
+        await orchestrator.resume_after_approval(task_id, body.approved, principal=principal)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ApprovalExpiredError as exc:
+        # The approval window closed - a state conflict, not a bad
+        # request: the caller did nothing wrong, the world moved on.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ApprovalBindingError as exc:
+        # The plan's arguments changed after a human approved them.
+        # Refusing with 409 (not executing "close enough") is the whole
+        # point of binding the approval to the exact arguments.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         # Not currently awaiting approval (wrong status, unknown to this
         # process, ...) - a conflict with the resource's current state,
@@ -159,8 +243,56 @@ async def approve_task(task_id: str, body: ApproveRequest) -> dict[str, Any]:
     return {"task_id": task_id}
 
 
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(
+    task_id: str,
+    principal: Annotated[Principal, Depends(require(Permission.TASK_CANCEL))],
+) -> dict[str, Any]:
+    """Cancels a running or paused task (Prompt §1's "agent interruption,
+    cancellation").
+
+    Cancellation is *cooperative and propagating*: the orchestrator sets
+    a cancellation flag the running step loop checks between steps,
+    cancels any in-flight asyncio work for this task, and marks every
+    descendant task cancelled too (see
+    `praxis.core.orchestrator.Orchestrator.cancel_task`). A step already
+    mid-execution is allowed to finish rather than being killed
+    mid-write - a half-applied external mutation would be far worse
+    than one extra completed step.
+    """
+    settings = Settings()
+    store = PostgresStore(settings)
+    try:
+        async with store.session() as session:
+            task = await session.get(Task, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
+        await authorize_resource(
+            principal,
+            Permission.TASK_CANCEL,
+            resource_type="task",
+            resource_id=task_id,
+            resource_tenant_id=task.tenant_id,
+        )
+    finally:
+        await store.dispose()
+
+    orchestrator = main._get_orchestrator()
+    try:
+        cancelled = await orchestrator.cancel_task(task_id, principal=principal)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"task_id": task_id, "cancelled": cancelled}
+
+
 @router.post("/tasks/{task_id}/clarify")
-async def clarify_task(task_id: str, body: ClarifyRequest) -> dict[str, Any]:
+async def clarify_task(
+    task_id: str,
+    body: ClarifyRequest,
+    principal: Annotated[Principal, Depends(require(Permission.TASK_APPROVE))],
+) -> dict[str, Any]:
     """Answers a pending `ClarificationRequest` and resumes (spec §8, §14).
 
     Nothing in this phase's scope ever raises a `ClarificationRequest`
@@ -181,6 +313,13 @@ async def clarify_task(task_id: str, body: ClarifyRequest) -> dict[str, Any]:
             task = await session.get(Task, task_id)
             if task is None:
                 raise HTTPException(status_code=404, detail=f"no task with id '{task_id}'")
+            await authorize_resource(
+                principal,
+                Permission.TASK_APPROVE,
+                resource_type="task",
+                resource_id=task_id,
+                resource_tenant_id=task.tenant_id,
+            )
             if task.status != "awaiting_clarification":
                 raise HTTPException(
                     status_code=409,
@@ -203,7 +342,7 @@ async def clarify_task(task_id: str, body: ClarifyRequest) -> dict[str, Any]:
 # `_synthesize_missing_skill`/`resume_after_approval` - see
 # praxis/core/orchestrator.py) - the one condition `stream_task` below
 # uses to know when to stop forwarding events and close the socket.
-_TERMINAL_TASK_STATUSES = {"completed", "failed"}
+_TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
 
 @router.websocket("/tasks/{task_id}/stream")
@@ -239,9 +378,27 @@ async def stream_task(websocket: WebSocket, task_id: str) -> None:
     settings = Settings()
     store = PostgresStore(settings)
     try:
+        # Authenticate before the handshake, the same way the HTTP
+        # routes do. A WebSocket cannot carry a 401 body, so an
+        # authentication failure closes with 4401 and a clear reason
+        # rather than accepting and then hanging up.
+        principal: Principal = SYSTEM_PRINCIPAL
+        if settings.auth_enabled:
+            credential = extract_credential(
+                websocket.headers.get("x-api-key"), websocket.headers.get("authorization")
+            )
+            try:
+                principal = await authenticate_api_key(store, credential)
+            except AuthenticationError:
+                await websocket.close(code=4401, reason="authentication required")
+                return
+
         async with store.session() as session:
             exists = await session.get(Task, task_id)
-        if exists is None:
+        # A task in another tenant is reported exactly like a missing
+        # one (4404), never as a distinguishable "forbidden" - the same
+        # no-cross-tenant-existence-leak rule the HTTP routes follow.
+        if exists is None or exists.tenant_id != principal.tenant_id:
             await websocket.close(code=4404, reason=f"no task with id '{task_id}'")
             return
 

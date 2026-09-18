@@ -23,11 +23,34 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Any, Iterator, MutableMapping
 
 import structlog
 
+from praxis.security.redaction import redact
+
 _CONFIGURED = False
+
+
+def _redaction_processor(
+    _logger: Any, _method_name: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Redacts PII/secrets out of every log event before it is rendered
+    (Prompt §9: "Redact sensitive payloads in tracing").
+
+    Sits immediately before the JSON renderer so it sees the fully
+    merged event - contextvars, bound values, and call-site kwargs
+    alike - and therefore cannot be bypassed by binding a secret
+    earlier in the chain.
+
+    Never raises: a redaction failure must degrade to *dropping the
+    offending value*, never to losing the log line or breaking the
+    caller that emitted it.
+    """
+    try:
+        return redact(dict(event_dict))
+    except Exception:  # noqa: BLE001 - see docstring
+        return {"event": event_dict.get("event", "unknown"), "redaction_error": True}
 
 
 def configure_logging(*, level: int = logging.INFO) -> None:
@@ -58,6 +81,7 @@ def configure_logging(*, level: int = logging.INFO) -> None:
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
+            _redaction_processor,
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),

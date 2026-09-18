@@ -34,13 +34,33 @@ from sqlalchemy.engine import Connection as SyncConnection
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from praxis.core.interfaces import Connector, ConnectorDescription, HealthStatus
+from praxis.safety.sql_guard import QueryCostLimits, SqlGuard
 
 # Same defense-in-depth guard as PostgresConnector, dialect-independent:
 # refuse anything that merely *looks* like a mutation before it ever
 # reaches the wire, regardless of which SQL dialect is on the other end.
+# Kept alongside the Phase 13 `SqlGuard` (see `read`'s docstring) as a
+# cheap first gate, not replaced by it.
 _MUTATING_QUERY = re.compile(
     r"^\s*(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE)\b", re.IGNORECASE
 )
+
+# SQLAlchemy dialect name -> sqlglot dialect name. Only the mappings
+# that actually differ or that this project has verified are listed;
+# anything unlisted is passed to sqlglot as `None` (its permissive
+# default grammar), which parses standard SQL correctly and simply
+# offers no dialect-specific handling.
+_SQLGLOT_DIALECTS: dict[str, str] = {
+    "postgresql": "postgres",
+    "sqlite": "sqlite",
+    "mysql": "mysql",
+    "mssql": "tsql",
+    "oracle": "oracle",
+    "snowflake": "snowflake",
+    "bigquery": "bigquery",
+    "duckdb": "duckdb",
+    "clickhouse": "clickhouse",
+}
 
 
 class SQLConnector(Connector):
@@ -52,10 +72,33 @@ class SQLConnector(Connector):
     ...) is what lets SQLAlchemy pick the right async driver and dialect.
     """
 
-    def __init__(self, dsn: str, name: str, read_only: bool = True) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        name: str,
+        read_only: bool = True,
+        *,
+        query_limits: QueryCostLimits | None = None,
+    ) -> None:
         self.name = name
         self.read_only = read_only
         self._dsn = dsn
+        # Phase 13: per-connector query bounds. A deployment that wants
+        # a table allow-list or a tighter row cap for one specific
+        # database passes its own limits here rather than changing a
+        # global - so one permissive connector can never relax another.
+        self._guard = SqlGuard(query_limits)
+
+    def _engine_dialect_name(self) -> str:
+        """The SQLAlchemy dialect name implied by this connector's DSN.
+
+        Derived from the URL rather than by opening a connection: the
+        guard needs the dialect on every `read()`, and paying for a
+        connection just to learn something the DSN already states would
+        be wasteful.
+        """
+        scheme = self._dsn.split("://", 1)[0]
+        return scheme.split("+", 1)[0].lower()
 
     @property
     def dsn(self) -> str:
@@ -97,11 +140,35 @@ class SQLConnector(Connector):
         return ConnectorDescription(kind="sql", schema={"dialect": dialect_name, "tables": tables})
 
     async def read(self, query: str, **params: Any) -> Any:
+        """Runs `query`, after real SQL validation and row bounding.
+
+        **Phase 13 (Prompt §8)**: the query is parsed with `sqlglot`
+        against this connector's *actual* dialect before it is sent.
+        That catches, with a specific error, what the old
+        regex-prefix check could not: stacked statements
+        (`SELECT 1; DROP TABLE users`), a mutation hidden behind a CTE,
+        an unbounded scan, or a cartesian product. A `SELECT` with no
+        `LIMIT` gets one injected at the guard's `max_rows`.
+
+        The regex check is deliberately *kept* as a cheap first gate
+        rather than replaced: if `sqlglot` ever fails to parse a
+        dialect-specific form, the guard raises `unparseable` and the
+        query is refused - so the two controls fail in the same safe
+        direction rather than the parser becoming a single point of
+        bypass.
+        """
         if self.read_only and _MUTATING_QUERY.match(query):
             raise PermissionError(
                 f"connector '{self.name}' is registered read-only; "
                 f"refusing a query that looks like a mutation"
             )
+
+        dialect = _SQLGLOT_DIALECTS.get(self._engine_dialect_name())
+        if self.read_only:
+            query = self._guard.validate_read(query, dialect=dialect)
+        else:
+            self._guard.assert_write_allowed(query, dialect=dialect, read_only=False)
+
         engine = create_async_engine(self._dsn)
         try:
             async with engine.connect() as conn:

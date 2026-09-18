@@ -17,24 +17,30 @@ own.
 from __future__ import annotations
 
 import mimetypes
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from praxis.api import main
+from praxis.api.dependencies import require
 from praxis.config import Settings
 from praxis.ingestion.parsers import registry as parser_registry
 from praxis.ingestion.pipeline import ingest
-from praxis.memory.blob_store import LocalBlobStore
+from praxis.memory.blob_store import LocalBlobStore, is_key_in_tenant
 from praxis.memory.db import PostgresStore
 from praxis.memory.vector_store import PgVectorStore
+from praxis.security.policy import Permission
+from praxis.security.principal import Principal
 
 router = APIRouter()
 
 
 @router.post("/attachments", status_code=201)
-async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_attachment(
+    principal: Annotated[Principal, Depends(require(Permission.ATTACHMENT_UPLOAD))],
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
     """File upload -> Ingestion pipeline (spec §5, §14).
 
     No `DocumentEnrichment` is constructed/passed here by default - it
@@ -67,6 +73,8 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
             embedder=main._embedder,
             vector_store=vector_store,
             db=db,
+            tenant_id=principal.tenant_id,
+            uploaded_by_user_id=principal.user_id,
         )
     except ValueError as exc:
         # e.g. no parser registered for this mime type - a client error,
@@ -90,7 +98,10 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
 
 
 @router.get("/artifacts/{key:path}")
-async def get_artifact(key: str) -> Response:
+async def get_artifact(
+    key: str,
+    principal: Annotated[Principal, Depends(require(Permission.ATTACHMENT_READ))],
+) -> Response:
     """Fetches a stored artifact - a rendered chart from `create_chart`
     (spec §13) today, and, going forward, whatever else lands in the
     same blob store under its own key - as a real binary response with
@@ -108,8 +119,15 @@ async def get_artifact(key: str) -> Response:
     (`FileNotFoundError`), into a clean `400`/`404` rather than letting
     either propagate as an unhandled `500` (spec §12: "never a silent
     no-op or a 500").
+
+    **Tenant isolation (Phase 12)**: artifact keys produced by skills are
+    namespaced per tenant (`praxis.memory.blob_store.tenant_artifact_key`),
+    and a key outside the caller's own namespace is reported as 404 -
+    never 403, which would confirm another tenant's artifact exists.
     """
     settings = Settings()
+    if not is_key_in_tenant(key, principal.tenant_id):
+        raise HTTPException(status_code=404, detail=f"no artifact stored under key '{key}'")
     blob_store = LocalBlobStore(settings.blob_store_root)
     try:
         data = await blob_store.get(key)

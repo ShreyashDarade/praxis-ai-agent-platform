@@ -26,7 +26,8 @@ from praxis.ingestion.chunkers.recursive_chunker import RecursiveChunker
 from praxis.ingestion.chunkers.table_aware_chunker import TableAwareChunker
 from praxis.ingestion.enrichment.document_enrichment import DocumentEnrichment, EnrichmentResult
 from praxis.memory.db import PostgresStore
-from praxis.memory.models import Attachment
+from praxis.memory.models import DEFAULT_TENANT_ID, Attachment
+from praxis.safety.untrusted import detect_injection_markers
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,8 @@ async def ingest(
     db: PostgresStore,
     chunker: Chunker | None = None,
     enrichment: DocumentEnrichment | None = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
+    uploaded_by_user_id: str | None = None,
 ) -> IngestResult:
     """Runs one attachment through the full ingestion pipeline; returns an
     `IngestResult` (an `Attachment.id` string, usable exactly as one).
@@ -123,7 +126,14 @@ async def ingest(
     `IngestResult` rather than dropped.
     """
     async with db.session() as session:
-        attachment = Attachment(mime_type=mime_type, source=source, size_bytes=len(data), status="uploaded")
+        attachment = Attachment(
+            tenant_id=tenant_id,
+            uploaded_by_user_id=uploaded_by_user_id,
+            mime_type=mime_type,
+            source=source,
+            size_bytes=len(data),
+            status="uploaded",
+        )
         session.add(attachment)
         await session.commit()
         attachment_id = attachment.id
@@ -138,6 +148,27 @@ async def ingest(
 
         parser = parser_registry.get_parser_for(mime_type)
         text = await parser.parse(data, mime_type)
+
+        # Phase 13 (Prompt §4: "Treat extracted content as untrusted
+        # data, never executable instructions"). Uploaded documents
+        # were previously the one untrusted-content path with no
+        # injection handling at all - web content had it, uploads did
+        # not, even though an uploaded PDF is exactly as attacker-
+        # controllable as a fetched page.
+        #
+        # Detection is recorded, not acted on by scrubbing: silently
+        # rewriting a user's document would be worse than flagging it.
+        # The marker names are persisted on the chunk metadata below so
+        # a retrieval consumer can decide how much to trust a chunk,
+        # and so an operator can audit what was flagged.
+        injection_markers = detect_injection_markers(text)
+        if injection_markers:
+            logger.warning(
+                "prompt_injection_markers_detected in attachment %s (source=%s): %s",
+                attachment_id,
+                source,
+                injection_markers,
+            )
 
         enrichment_result: EnrichmentResult | None = None
         if enrichment is not None:
@@ -155,8 +186,16 @@ async def ingest(
                     "mime_type": mime_type,
                     "chunk_index": chunk_index,
                     "content": chunk_text,
+                    "attachment_id": attachment_id,
+                    "tenant_id": tenant_id,
+                    # Carried per-chunk so a retrieval consumer can see
+                    # that this text came from a document flagged for
+                    # injection markers, rather than that signal being
+                    # lost at ingest time.
+                    "untrusted": True,
+                    "injection_markers": injection_markers,
                 }
-                await vector_store.upsert(doc_id, embedding, metadata)
+                await vector_store.upsert(doc_id, embedding, metadata, tenant_id=tenant_id)
 
         await _set_status(db, attachment_id, "indexed")
     except Exception:
@@ -175,7 +214,15 @@ async def retrieve(
     top_k: int,
     embedder: Embedder,
     vector_store: VectorStore,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> list[dict[str, Any]]:
-    """Embeds `query_text` and returns the `top_k` nearest chunks (spec §5 step 6)."""
+    """Embeds `query_text` and returns the `top_k` nearest chunks (spec §5 step 6).
+
+    `tenant_id` is pushed down into the store's own query rather than
+    post-filtering here, so another tenant's chunks never consume the
+    `top_k` budget (see `praxis.memory.vector_store.PgVectorStore`).
+    """
     (query_embedding,) = await embedder.embed([query_text])
-    return await vector_store.similarity_search(query_embedding, top_k=top_k)
+    return await vector_store.similarity_search(
+        query_embedding, top_k=top_k, tenant_id=tenant_id
+    )

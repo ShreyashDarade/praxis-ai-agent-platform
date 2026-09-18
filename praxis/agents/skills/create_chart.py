@@ -34,7 +34,8 @@ from praxis.agents.skill import Skill
 from praxis.agents.skill_registry import register_skill
 from praxis.analytics.visualize import PlotlyVisualizer
 from praxis.config import Settings
-from praxis.memory.blob_store import LocalBlobStore
+from praxis.memory.blob_store import LocalBlobStore, tenant_artifact_key
+from praxis.memory.models import DEFAULT_TENANT_ID
 
 # One key prefix for every chart this skill ever stores, under the
 # shared blob store root - mirrors how attachment blobs get their own
@@ -80,7 +81,17 @@ class CreateChartSkill(Skill):
         settings = Settings()
         blob_store = LocalBlobStore(settings.blob_store_root)
         extension = _EXTENSION_BY_MIME_TYPE.get(artifact.mime_type, "bin")
-        artifact_key = f"{_ARTIFACT_KEY_PREFIX}/{uuid.uuid4().hex}.{extension}"
+        # Phase 12: the Orchestrator injects `tenant_id` out of band on
+        # every skill call (the same mechanism as `known_urls`), so a
+        # stored artifact lands in its owning tenant's namespace and
+        # `GET /artifacts/{key}` can refuse a cross-tenant read from the
+        # key alone. A direct caller that passes no tenant (a unit test,
+        # a CLI one-off) lands in the default tenant, which is a real
+        # tenant, never an "unscoped" bucket.
+        tenant_id = kwargs.get("tenant_id") or DEFAULT_TENANT_ID
+        artifact_key = tenant_artifact_key(
+            tenant_id, f"{_ARTIFACT_KEY_PREFIX}/{uuid.uuid4().hex}.{extension}"
+        )
         await blob_store.put(artifact_key, artifact.content)
 
         return {"artifact_key": artifact_key, "mime_type": artifact.mime_type}

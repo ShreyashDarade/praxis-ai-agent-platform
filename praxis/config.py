@@ -43,6 +43,28 @@ class Settings(BaseSettings):
     # `praxis.api.main`'s module-level setup.
     health_scan_interval_seconds: int = Field(default=300, ge=1)
 
+    # Phase 12 (Multi-tenancy, identity, RBAC/ABAC - Prompt §8, §11).
+    # Off by default so a single-operator deployment (and this repo's
+    # own test suite) keeps working exactly as before: with auth
+    # disabled every request runs as `praxis.security.principal.
+    # SYSTEM_PRINCIPAL`, inside the real `DEFAULT_TENANT_ID` tenant, and
+    # still flows through the identical `PolicyEngine` + audit path - the
+    # isolation code is never bypassed, only the *credential* step is.
+    # Switching this on makes `X-API-Key` (or `Authorization: Bearer`)
+    # mandatory on every non-public endpoint.
+    auth_enabled: bool = Field(
+        default=False,
+        description="Require an API key on every request and resolve a real per-user Principal",
+    )
+
+    # How long a pending approval stays decidable before the sweep fails
+    # the task (Prompt §8's "expiry" binding). Distinct from
+    # `approval_timeout_seconds` below, which is when the *task* is
+    # swept; this is the window written onto the `ApprovalRecord` itself,
+    # and defaults to the same value so the two never disagree unless an
+    # operator deliberately sets them apart.
+    approval_ttl_seconds: int = Field(default=3600, ge=1)
+
     # Phase 7 (Exception handling, spec §12): how long a task may sit
     # `awaiting_approval`/`awaiting_clarification` before
     # `praxis.api.main.sweep_stale_approvals` marks it `failed` with an

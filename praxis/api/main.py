@@ -16,9 +16,10 @@ attributes tests reach into directly.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 import structlog
 from docker.errors import DockerException
@@ -46,6 +47,7 @@ from praxis.memory.models import HealthRecord, Task
 from praxis.observability.logging import configure_logging
 from praxis.observability.tracing import configure_tracing
 from praxis.sandbox.executor import DockerSandboxExecutor
+from praxis.security.provisioning import ensure_default_tenant
 
 # Observability (spec §10) - configured once, at import time, before
 # anything else in this module can possibly log or open a span; both
@@ -367,8 +369,50 @@ def _get_orchestrator() -> Orchestrator:
 # order of these two statements relative to each other doesn't matter -
 # but living here, at the bottom, keeps this file reading top-to-bottom
 # as "build the shared wiring, then mount the routes on top of it".
-from praxis.api.routes import attachments, health, tasks  # noqa: E402
+from praxis.api.routes import admin, attachments, health, tasks  # noqa: E402
 
 app.include_router(health.router)
 app.include_router(attachments.router)
 app.include_router(tasks.router)
+app.include_router(admin.router)
+
+
+async def _bootstrap_default_tenant() -> None:
+    """Guarantees `DEFAULT_TENANT_ID` resolves to a real tenant row.
+
+    The Alembic migration inserts it, but a database built by
+    `Base.metadata.create_all` (every test, and any quick local
+    scratch DB) has no migration history - this makes both paths
+    converge on the same invariant: there is always a real default
+    tenant, never a dangling tenant id.
+
+    Degrades gracefully, exactly like `_build_connector_registry` and
+    `_build_scheduler` above: an unconfigured/unreachable database must
+    not prevent the app from starting.
+    """
+    try:
+        settings = Settings()
+    except Exception:  # noqa: BLE001
+        return
+    store = PostgresStore(settings)
+    try:
+        await ensure_default_tenant(store)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("default_tenant_bootstrap_skipped", error=str(exc))
+    finally:
+        await store.dispose()
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Startup/shutdown hooks (the modern replacement for `on_event`)."""
+    await _bootstrap_default_tenant()
+    yield
+
+
+# Assigned after the fact rather than passed to `FastAPI(...)` above,
+# because the routers - and the singletons they close over - are built
+# between that constructor call and here; keeping the constructor at
+# the top of the module is what makes `app` importable by the route
+# modules in the first place.
+app.router.lifespan_context = _lifespan

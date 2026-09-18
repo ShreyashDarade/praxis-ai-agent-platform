@@ -74,6 +74,14 @@ dependencies = [
     # discipline as every pin above.
     "plotly>=7.1,<8.0",
     "kaleido>=1.4,<2.0",
+    # Phase 13 (Safety, Prompt §8). `sqlglot` backs
+    # `praxis/safety/sql_guard.py` - dialect-aware SQL parsing used to
+    # classify statements, catch stacked statements and hidden
+    # mutations, and bound query cost. Pure Python, no native
+    # dependency, which is what makes it safe to put on the read path
+    # of every connector query. Pinned to the version actually resolved
+    # and verified in this venv, same discipline as every pin above.
+    "sqlglot>=27.29,<28.0",
 ]
 
 # Windows-only caveat, discovered and fixed while verifying this exact

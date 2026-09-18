@@ -41,6 +41,22 @@ from praxis.core.interfaces import SandboxExecutor, SandboxResult
 DEFAULT_IMAGE = "python:3.11-slim"
 DEFAULT_MEM_LIMIT = "256m"
 
+# Phase 13 isolation bounds (see `DockerSandboxExecutor`'s docstring for
+# what each one actually prevents).
+#
+# 1.0 = one full CPU core. Generous enough that a legitimate synthesis
+# self-test never times out because of throttling, bounded enough that a
+# runaway loop cannot saturate the host.
+DEFAULT_CPU_LIMIT = 1.0
+# Bounds process creation - this, not the memory cap, is what actually
+# stops a fork bomb. 128 is far above what any single-file stdlib
+# self-test needs and far below what exhausts the host's pid space.
+DEFAULT_PIDS_LIMIT = 128
+# The root filesystem is read-only, so scratch writes need somewhere to
+# go; 64 MiB of tmpfs at /tmp is enough for a test fixture (e.g. a small
+# SQLite database a self-test builds) without becoming usable storage.
+DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
+
 
 def build_docker_client(docker_host: str | None = None) -> docker.DockerClient:
     """Constructs a real `docker.DockerClient`.
@@ -76,13 +92,37 @@ def is_docker_reachable(docker_host: str | None = None) -> bool:
 
 
 class DockerSandboxExecutor(SandboxExecutor):
-    """Runs Python code inside an ephemeral, ephemeral-per-call container.
+    """Runs Python code inside an ephemeral, per-call container.
 
-    Every `run()` call: creates one detached container from a pinned
-    base image, no network (`network_mode="none"`), a memory cap
-    (`mem_limit`), waits up to `timeout_seconds` for it to finish,
-    captures stdout/stderr, and always removes the container afterward
-    - even on failure or timeout, so nothing is ever left behind.
+    Every `run()` call creates one detached container from a pinned
+    base image, waits up to `timeout_seconds`, captures stdout/stderr,
+    and always removes the container afterward - even on failure or
+    timeout, so nothing is ever left behind.
+
+    **Isolation posture (Phase 13, Prompt §8: "deny-by-default network
+    egress, bounded resources, read-only mounts where possible").**
+    Each control below closes a specific escape or exhaustion route,
+    and they are independent - none of them is load-bearing alone:
+
+    - `network_mode="none"` - no egress at all, so generated code
+      cannot exfiltrate or fetch. This is the deny-by-default egress
+      rule, enforced by the container runtime rather than by asking
+      the code not to.
+    - `mem_limit` + `nano_cpus` - bounded memory and CPU, so a runaway
+      loop degrades into a killed container rather than starving the
+      host.
+    - `pids_limit` - bounds process creation, which is what actually
+      stops a fork bomb (a memory cap alone does not).
+    - `read_only=True` root filesystem plus a small `tmpfs` at `/tmp` -
+      generated code can still write scratch files (some legitimately
+      need to) but cannot persist anything into the image layer or
+      tamper with the interpreter.
+    - `cap_drop=["ALL"]` and `security_opt=["no-new-privileges"]` - no
+      Linux capabilities and no privilege escalation via setuid
+      binaries, so even a container-breakout primitive has nothing to
+      escalate with.
+    - `user="nobody"` - never root inside the container, so the
+      above restrictions cannot be relaxed from within.
     """
 
     def __init__(
@@ -91,9 +131,15 @@ class DockerSandboxExecutor(SandboxExecutor):
         docker_host: str | None = None,
         image: str = DEFAULT_IMAGE,
         mem_limit: str = DEFAULT_MEM_LIMIT,
+        cpu_limit: float = DEFAULT_CPU_LIMIT,
+        pids_limit: int = DEFAULT_PIDS_LIMIT,
+        tmpfs_size_bytes: int = DEFAULT_TMPFS_BYTES,
     ) -> None:
         self._image = image
         self._mem_limit = mem_limit
+        self._cpu_limit = cpu_limit
+        self._pids_limit = pids_limit
+        self._tmpfs_size_bytes = tmpfs_size_bytes
         self._client = build_docker_client(docker_host)
         self._ensure_image()
 
@@ -117,8 +163,26 @@ class DockerSandboxExecutor(SandboxExecutor):
             ["python", "-c", code],
             name=container_name,
             detach=True,
+            # Deny-by-default egress: the container has no network at
+            # all, enforced by the runtime rather than by policy text.
             network_mode="none",
             mem_limit=self._mem_limit,
+            # Docker expresses CPU quota in billionths of a core.
+            nano_cpus=int(self._cpu_limit * 1_000_000_000),
+            pids_limit=self._pids_limit,
+            # Read-only root + a bounded tmpfs for legitimate scratch
+            # writes (a self-test building a fixture SQLite file).
+            read_only=True,
+            tmpfs={"/tmp": f"rw,size={self._tmpfs_size_bytes},mode=1777"},
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges"],
+            user="nobody",
+            # `HOME`/`TMPDIR` point at the writable tmpfs: as `nobody`
+            # with a read-only root, anything defaulting to `/home` or
+            # the CWD would otherwise fail for a reason unrelated to
+            # the code under test.
+            environment={"HOME": "/tmp", "TMPDIR": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"},
+            working_dir="/tmp",
             stdout=True,
             stderr=True,
         )

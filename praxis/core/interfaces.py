@@ -52,21 +52,43 @@ class RelationalStore(HealthCheckable):
 
 
 class VectorStore(abc.ABC):
-    @abc.abstractmethod
-    async def upsert(self, doc_id: str, embedding: list[float], metadata: dict[str, Any]) -> None: ...
+    """`tenant_id` is keyword-only with a default on both methods so every
+    pre-tenancy caller keeps working unchanged while a tenant-aware
+    caller gets real isolation - filtering happens in the backend's own
+    query, never by post-filtering results (see `PgVectorStore`)."""
 
     @abc.abstractmethod
-    async def similarity_search(self, embedding: list[float], top_k: int = 5) -> list[dict[str, Any]]: ...
+    async def upsert(
+        self,
+        doc_id: str,
+        embedding: list[float],
+        metadata: dict[str, Any],
+        *,
+        tenant_id: str = ...,
+    ) -> None: ...
+
+    @abc.abstractmethod
+    async def similarity_search(
+        self, embedding: list[float], top_k: int = 5, *, tenant_id: str = ...
+    ) -> list[dict[str, Any]]: ...
 
 
 class GraphStore(abc.ABC):
     @abc.abstractmethod
     async def add_edge(
-        self, source: str, relation: str, target: str, metadata: dict[str, Any] | None = None
+        self,
+        source: str,
+        relation: str,
+        target: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        tenant_id: str = ...,
     ) -> None: ...
 
     @abc.abstractmethod
-    async def neighbors(self, node: str, relation: str | None = None) -> list[dict[str, Any]]: ...
+    async def neighbors(
+        self, node: str, relation: str | None = None, *, tenant_id: str = ...
+    ) -> list[dict[str, Any]]: ...
 
 
 class BlobStore(abc.ABC):

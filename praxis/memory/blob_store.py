@@ -15,6 +15,35 @@ from pathlib import Path
 
 from praxis.core.interfaces import BlobStore
 
+# Phase 12: every artifact a skill produces is written under
+# `t/<tenant_id>/...` so tenant ownership is a property of the key
+# itself, checkable without a database lookup on the read path
+# (`GET /artifacts/{key}`). Attachment blobs keep their historical flat
+# `<attachment_id>` key: those are already looked up through the
+# `attachments` table, which carries a real `tenant_id` column, so the
+# ownership check there reads the row rather than parsing the key.
+_TENANT_KEY_PREFIX = "t"
+
+
+def tenant_artifact_key(tenant_id: str, relative_key: str) -> str:
+    """Namespaces `relative_key` under `tenant_id`.
+
+    e.g. `tenant_artifact_key("abc", "charts/x.png") -> "t/abc/charts/x.png"`.
+    """
+    return f"{_TENANT_KEY_PREFIX}/{tenant_id}/{relative_key.lstrip('/')}"
+
+
+def is_key_in_tenant(key: str, tenant_id: str) -> bool:
+    """True iff `key` lives inside `tenant_id`'s artifact namespace.
+
+    A key with no tenant prefix at all is treated as **not** belonging
+    to any tenant and is therefore refused - failing closed. Legacy
+    flat keys predate tenant namespacing and are reachable only through
+    a row lookup that carries its own `tenant_id`, never through this
+    path.
+    """
+    return key.startswith(f"{_TENANT_KEY_PREFIX}/{tenant_id}/")
+
 
 class LocalBlobStore(BlobStore):
     """Stores blobs as files under `root`, keyed by a caller-supplied relative key."""

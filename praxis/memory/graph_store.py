@@ -18,22 +18,34 @@ from sqlalchemy import select
 
 from praxis.core.interfaces import GraphStore
 from praxis.memory.db import PostgresStore
-from praxis.memory.models import GraphEdge
+from praxis.memory.models import DEFAULT_TENANT_ID, GraphEdge
 
 
 class PgGraphStore(GraphStore):
-    """`GraphEdge` rows: a lightweight knowledge graph (spec §9)."""
+    """`GraphEdge` rows: a lightweight knowledge graph (spec §9).
+
+    Tenant-scoped exactly like `PgVectorStore`: the `tenant_id`
+    predicate is part of the traversal query, so one tenant's lineage
+    or entity graph can never be walked from another's.
+    """
 
     def __init__(self, store: PostgresStore) -> None:
         self._store = store
 
     async def add_edge(
-        self, source: str, relation: str, target: str, metadata: dict[str, Any] | None = None
+        self,
+        source: str,
+        relation: str,
+        target: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
     ) -> None:
         async with self._store.session() as session:
             async with session.begin():
                 session.add(
                     GraphEdge(
+                        tenant_id=tenant_id,
                         source=source,
                         relation=relation,
                         target=target,
@@ -41,8 +53,16 @@ class PgGraphStore(GraphStore):
                     )
                 )
 
-    async def neighbors(self, node: str, relation: str | None = None) -> list[dict[str, Any]]:
-        stmt = select(GraphEdge).where(GraphEdge.source == node)
+    async def neighbors(
+        self,
+        node: str,
+        relation: str | None = None,
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> list[dict[str, Any]]:
+        stmt = select(GraphEdge).where(
+            GraphEdge.source == node, GraphEdge.tenant_id == tenant_id
+        )
         if relation is not None:
             stmt = stmt.where(GraphEdge.relation == relation)
 

@@ -14,16 +14,32 @@ from sqlalchemy import delete, select
 
 from praxis.core.interfaces import VectorStore
 from praxis.memory.db import PostgresStore
-from praxis.memory.models import VectorChunk
+from praxis.memory.models import DEFAULT_TENANT_ID, VectorChunk
 
 
 class PgVectorStore(VectorStore):
-    """`VectorChunk` rows via pgvector's cosine-distance operator (`<=>`)."""
+    """`VectorChunk` rows via pgvector's cosine-distance operator (`<=>`).
+
+    **Tenant isolation (Phase 12)**: every row carries a `tenant_id`, and
+    `similarity_search` filters on it *in the SQL WHERE clause*, not by
+    post-filtering results in Python. That distinction is load-bearing:
+    post-filtering would let another tenant's chunks consume the `top_k`
+    budget (silently degrading recall, and leaking the *existence* of
+    neighbouring data through result counts), whereas an indexed
+    predicate means a tenant's search only ever ranks its own rows.
+    """
 
     def __init__(self, store: PostgresStore) -> None:
         self._store = store
 
-    async def upsert(self, doc_id: str, embedding: list[float], metadata: dict[str, Any]) -> None:
+    async def upsert(
+        self,
+        doc_id: str,
+        embedding: list[float],
+        metadata: dict[str, Any],
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> None:
         # `VectorChunk.doc_id` has no unique constraint at the schema
         # level (see praxis/memory/models.py) - upsert semantics are
         # implemented here in application code: delete any existing
@@ -41,9 +57,14 @@ class PgVectorStore(VectorStore):
         content = str(metadata.pop("content", ""))
         async with self._store.session() as session:
             async with session.begin():
-                await session.execute(delete(VectorChunk).where(VectorChunk.doc_id == doc_id))
+                await session.execute(
+                    delete(VectorChunk).where(
+                        VectorChunk.doc_id == doc_id, VectorChunk.tenant_id == tenant_id
+                    )
+                )
                 session.add(
                     VectorChunk(
+                        tenant_id=tenant_id,
                         doc_id=doc_id,
                         content=content,
                         embedding=embedding,
@@ -51,9 +72,20 @@ class PgVectorStore(VectorStore):
                     )
                 )
 
-    async def similarity_search(self, embedding: list[float], top_k: int = 5) -> list[dict[str, Any]]:
+    async def similarity_search(
+        self,
+        embedding: list[float],
+        top_k: int = 5,
+        *,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> list[dict[str, Any]]:
         distance = VectorChunk.embedding.cosine_distance(embedding).label("distance")
-        stmt = select(VectorChunk, distance).order_by(distance).limit(top_k)
+        stmt = (
+            select(VectorChunk, distance)
+            .where(VectorChunk.tenant_id == tenant_id)
+            .order_by(distance)
+            .limit(top_k)
+        )
 
         async with self._store.session() as session:
             result = await session.execute(stmt)

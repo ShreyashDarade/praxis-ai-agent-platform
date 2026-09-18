@@ -23,6 +23,7 @@ from praxis.agents.skill_registry import register_skill
 from praxis.config import Settings
 from praxis.ingestion.embedders.sentence_transformer_embedder import get_default_embedder
 from praxis.ingestion.pipeline import retrieve
+from praxis.memory.models import DEFAULT_TENANT_ID
 from praxis.memory.db import PostgresStore
 from praxis.memory.vector_store import PgVectorStore
 
@@ -37,6 +38,11 @@ class RetrieveDocumentsSkill(Skill):
 
     async def run(self, **kwargs: Any) -> Any:
         query = kwargs["query"]
+        # Phase 12: the Orchestrator injects `tenant_id` out of band on
+        # every skill call. Retrieval is filtered to that tenant inside
+        # the vector store's own SQL - one tenant can never retrieve,
+        # cite, or even see the existence of another's chunks.
+        tenant_id = kwargs.get("tenant_id") or DEFAULT_TENANT_ID
         settings = Settings()
         db = PostgresStore(settings)
         try:
@@ -46,6 +52,7 @@ class RetrieveDocumentsSkill(Skill):
                 top_k=_DEFAULT_TOP_K,
                 embedder=get_default_embedder(),
                 vector_store=vector_store,
+                tenant_id=tenant_id,
             )
         finally:
             await db.dispose()
