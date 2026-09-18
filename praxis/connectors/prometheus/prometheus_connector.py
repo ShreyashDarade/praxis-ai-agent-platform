@@ -1,4 +1,4 @@
-# praxis/connectors/prometheus/connector.py
+# praxis/connectors/prometheus/prometheus_connector.py
 """Prometheus HTTP API connector (spec §6, §15, §16.1's fetch-metrics step)."""
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
-# praxis/connectors/sql/connector.py
+# praxis/connectors/sql/sql_connector.py
 """Connector for an arbitrary, user-specified SQL database of any dialect (spec §6).
 
-`praxis.connectors.postgres.connector.PostgresConnector` talks to
+`praxis.connectors.postgres.postgres_connector.PostgresConnector` talks to
 asyncpg directly, which is exactly what makes it Postgres-only. This
 connector goes through SQLAlchemy's async engine instead - the same
 dialect abstraction `praxis.memory.db.PostgresStore` already uses for

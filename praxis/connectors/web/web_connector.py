@@ -1,4 +1,4 @@
-# praxis/connectors/web/connector.py
+# praxis/connectors/web/web_connector.py
 """`WebConnector`: web search/read/crawl behind the same `Connector`
 interface as every other external system Praxis talks to (spec §6.1's
 closing line: "no special-cased subsystem, just a connector whose

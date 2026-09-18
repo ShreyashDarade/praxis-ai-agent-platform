@@ -1,4 +1,4 @@
-# praxis/connectors/mcp/connector.py
+# praxis/connectors/mcp/mcp_connector.py
 """Universal connector: wraps any real Model Context Protocol server (spec §6).
 
 Phase 2's four connectors are each a hand-written, stack-specific

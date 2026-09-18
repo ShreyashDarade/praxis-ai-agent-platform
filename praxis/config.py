@@ -14,7 +14,7 @@ class MCPServerConfig(BaseModel):
     parse a whole list of these straight out of a JSON-encoded env var.
     Exactly one of ``command`` (stdio) or ``url`` (HTTP/SSE) is expected
     to be set per entry - the same validation
-    ``praxis.connectors.mcp.connector.MCPConnector.__init__`` enforces
+    ``praxis.connectors.mcp.mcp_connector.MCPConnector.__init__`` enforces
     when `praxis.connectors.bootstrap.build_registry` constructs one
     from this config.
     """
@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     # is configured in this development environment - `WebConnector.search()`
     # raises a clear `SearchProviderNotConfiguredError` rather than a
     # silent empty-results no-op when this is unset (see
-    # `praxis.connectors.web.connector`).
+    # `praxis.connectors.web.web_connector`).
     tavily_api_key: str | None = Field(
         default=None, description="Tavily search API key for TavilySearchProvider"
     )

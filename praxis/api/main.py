@@ -21,7 +21,7 @@ from praxis.agents.scheduler import Scheduler
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
 from praxis.connectors.registry import ConnectorRegistry
-from praxis.connectors.sql.connector import SQLConnector
+from praxis.connectors.sql.sql_connector import SQLConnector
 from praxis.core.events import task_event_bus, task_state_snapshot
 from praxis.core.exceptions import ApprovalTimeoutError
 from praxis.core.interfaces import HealthStatus

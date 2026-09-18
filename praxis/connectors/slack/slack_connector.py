@@ -1,4 +1,4 @@
-# praxis/connectors/slack/connector.py
+# praxis/connectors/slack/slack_connector.py
 """Slack connector (spec §6, §16.1), built on the official slack_sdk AsyncWebClient.
 
 Unlike the other three connectors, Slack defaults to ``read_only=False``

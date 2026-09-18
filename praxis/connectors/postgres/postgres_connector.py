@@ -1,4 +1,4 @@
-# praxis/connectors/postgres/connector.py
+# praxis/connectors/postgres/postgres_connector.py
 """Connector for an arbitrary, user-specified Postgres database (spec §6, §16.2).
 
 This is distinct from praxis.memory.db.PostgresStore, which is Praxis's

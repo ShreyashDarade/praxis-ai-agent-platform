@@ -38,7 +38,7 @@ from typing import Any
 from praxis.agents.skill import Skill, SkillConfigurationError
 from praxis.agents.skill_registry import register_skill
 from praxis.config import Settings
-from praxis.connectors.web.connector import WebConnector
+from praxis.connectors.web.web_connector import WebConnector
 from praxis.connectors.web.search_provider import TavilySearchProvider
 
 _DEFAULT_MAX_RESULTS = 5

@@ -22,7 +22,7 @@ from typing import Any
 from praxis.agents.skill import Skill, SkillConfigurationError
 from praxis.agents.skill_registry import register_skill
 from praxis.config import Settings
-from praxis.connectors.slack.connector import SlackConnector
+from praxis.connectors.slack.slack_connector import SlackConnector
 
 
 class PostSlackMessageSkill(Skill):

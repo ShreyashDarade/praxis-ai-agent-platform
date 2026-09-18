@@ -20,7 +20,7 @@ from typing import Any
 
 from praxis.agents.skill import Skill
 from praxis.agents.skill_registry import register_skill
-from praxis.connectors.web.connector import WebConnector
+from praxis.connectors.web.web_connector import WebConnector
 
 _WEB_TOOLS_ENABLED = os.environ.get("PRAXIS_WEB_TOOLS_ENABLED", "").strip().lower() in (
     "1", "true", "yes", "on",

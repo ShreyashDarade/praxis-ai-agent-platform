@@ -1,4 +1,4 @@
-# praxis/connectors/github/connector.py
+# praxis/connectors/github/github_connector.py
 """GitHub REST API connector (spec §6, §15, §16).
 
 Talks to https://api.github.com directly via httpx - GitHub's REST API
