@@ -78,6 +78,13 @@ class _ChartSpec:
     build: _ChartBuilder
     required: tuple[str, ...] = ()
     optional: tuple[str, ...] = ()
+    # Roles that may name SEVERAL columns at once, e.g. `y: [revenue,
+    # labour_cost]` to plot two series on one chart. Only the Plotly
+    # Express marks support this - `px.bar(frame, y=["a","b"])` melts
+    # wide data itself - so it is declared per chart type rather than
+    # assumed, and a type that cannot do it says so instead of failing
+    # somewhere inside plotly.
+    multi: tuple[str, ...] = ()
 
 
 def _express(builder: Callable[..., go.Figure], **fixed: Any) -> _ChartBuilder:
@@ -92,7 +99,24 @@ def _express(builder: Callable[..., go.Figure], **fixed: Any) -> _ChartBuilder:
     """
 
     def build(frame: pd.DataFrame, columns: dict[str, str]) -> go.Figure:
-        return builder(frame, **columns, **fixed)
+        figure = builder(frame, **columns, **fixed)
+        # Several measures on one bar chart are grouped, not stacked.
+        #
+        # Plotly stacks by default, which is right when the series are
+        # parts of a whole and actively misleading when they are not:
+        # stacking revenue on top of labour cost draws a bar whose
+        # height is revenue-plus-cost, a quantity that means nothing.
+        # Comparison is what a reader wants from two measures, and
+        # grouped bars are what show it.
+        y = columns.get("y")
+        if (
+            isinstance(y, (list, tuple))
+            and len(y) > 1
+            and figure.data
+            and getattr(figure.data[0], "type", "") == "bar"
+        ):
+            figure.update_layout(barmode="group")
+        return figure
 
     return build
 
@@ -282,9 +306,15 @@ def _build_cohort(frame: pd.DataFrame, columns: dict[str, str]) -> go.Figure:
 _CHART_SPECS: dict[str, _ChartSpec] = {
     "kpi_card": _ChartSpec(_build_kpi_card, required=("value",), optional=("label", "delta")),
     "table": _ChartSpec(_build_table),
-    "line": _ChartSpec(_express(px.line), required=("x", "y"), optional=("color",)),
-    "bar": _ChartSpec(_express(px.bar), required=("x", "y"), optional=("color",)),
-    "area": _ChartSpec(_express(px.area), required=("x", "y"), optional=("color",)),
+    "line": _ChartSpec(
+        _express(px.line), required=("x", "y"), optional=("color",), multi=("y",)
+    ),
+    "bar": _ChartSpec(
+        _express(px.bar), required=("x", "y"), optional=("color",), multi=("y",)
+    ),
+    "area": _ChartSpec(
+        _express(px.area), required=("x", "y"), optional=("color",), multi=("y",)
+    ),
     "pie": _ChartSpec(_express(px.pie), required=("names", "values"), optional=("color",)),
     "donut": _ChartSpec(
         _express(px.pie, hole=_DONUT_HOLE), required=("names", "values"), optional=("color",)
@@ -454,12 +484,34 @@ class PlotlyVisualizer(Visualizer):
             )
 
         frame = pd.DataFrame(data)
-        columns: dict[str, str] = {
+        columns: dict[str, Any] = {
             role: encoding[role]
             for role in (*spec.required, *spec.optional)
             if role in encoding
         }
-        missing_columns = [column for column in columns.values() if column not in frame.columns]
+
+        # A role may name one column or, where the chart type allows it,
+        # several. Both are normalised to a list here so validation is
+        # one code path - and a list arriving for a role that cannot
+        # take one is refused with a message naming the role, rather
+        # than reaching pandas and surfacing as "unhashable type: list"
+        # from somewhere the caller has no way to connect to their
+        # encoding.
+        missing_columns: list[str] = []
+        for role, value in columns.items():
+            names = value if isinstance(value, (list, tuple)) else [value]
+            if isinstance(value, (list, tuple)):
+                if role not in spec.multi:
+                    raise ValueError(
+                        f"role {role!r} for chart_type {chart_type!r} takes a single "
+                        f"column, but {list(value)!r} was given; chart types accepting "
+                        f"several are those with a {spec.multi or '(none)'} role"
+                    )
+                if not names:
+                    raise ValueError(f"role {role!r} was given an empty list of columns")
+            missing_columns.extend(
+                name for name in names if name not in frame.columns
+            )
         if missing_columns:
             raise ValueError(
                 f"encoding references column(s) not present in data: {missing_columns}"

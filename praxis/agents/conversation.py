@@ -322,7 +322,15 @@ class ConversationService:
         whether to wait.
         """
         try:
-            await self._orchestrator.drive_task(task_id)
+            # The user's own principal, not the default.
+            #
+            # `drive_task` defaults to SYSTEM_PRINCIPAL, and omitting it
+            # here ran every conversation turn with system rights in the
+            # default tenant: the user could not see their own uploads,
+            # and the run held every permission the platform has. Caught
+            # by driving the real server rather than by a test, because
+            # the fixtures used skills that never consult the tenant.
+            await self._orchestrator.drive_task(task_id, principal=principal)
         except Exception as exc:  # noqa: BLE001 - a turn must always answer
             _logger.exception("conversation_turn_failed", task_id=task_id)
             await self._write_assistant_message(

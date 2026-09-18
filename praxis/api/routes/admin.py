@@ -141,6 +141,55 @@ async def list_users(
     }
 
 
+@router.get("/api-keys")
+async def list_api_keys(
+    principal: Annotated[Principal, Depends(require(Permission.TENANT_ADMIN))],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Every API key in the caller's own tenant.
+
+    Keys could be issued and revoked but never listed, so an admin had
+    no way to see what existed - which makes revocation a guess. The
+    hash is never returned: a key's plaintext exists once, in the issue
+    response, and nothing here can reconstruct it. What is returned is
+    what an operator actually needs to decide whether to revoke
+    something - who holds it, when it was last used, and whether it is
+    still live.
+    """
+    store = PostgresStore(settings)
+    try:
+        async with store.session() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(ApiKey)
+                        .where(ApiKey.tenant_id == principal.tenant_id)
+                        .order_by(ApiKey.created_at.desc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    finally:
+        await store.dispose()
+
+    return {
+        "api_keys": [
+            {
+                "id": key.id,
+                "user_id": key.user_id,
+                "name": key.name,
+                "scopes": list(key.scopes or []),
+                "revoked": key.revoked_at is not None,
+                "last_used_at": key.last_used_at.isoformat() if key.last_used_at else None,
+                "expires_at": key.expires_at.isoformat() if key.expires_at else None,
+                "created_at": key.created_at.isoformat(),
+            }
+            for key in rows
+        ]
+    }
+
+
 @router.post("/api-keys", status_code=201)
 async def issue_api_key(
     body: IssueKeyRequest,

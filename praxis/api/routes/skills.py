@@ -125,8 +125,10 @@ async def create_skill(
         # the author apart.
         raise HTTPException(status_code=400, detail=f"malformed SKILL.md: {exc}") from exc
     except ProcedureError as exc:
+        # A conflict is not the author's mistake, so it is not a 400.
+        status = 409 if exc.reason == "version_conflict" else 400
         raise HTTPException(
-            status_code=400,
+            status_code=status,
             detail={"message": str(exc), "reason": exc.reason, "skill": exc.skill},
         ) from exc
     finally:

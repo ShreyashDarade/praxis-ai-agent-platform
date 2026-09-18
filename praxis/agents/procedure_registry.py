@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from praxis.agents import skill_registry
 from praxis.agents.manifest import ManifestError, SkillManifest, compute_code_hash
@@ -176,7 +178,25 @@ async def register_procedure(
     )
 
     async with store.session() as session:
+        # Re-submitting an existing name is an edit, not an error, so it
+        # becomes the next version rather than colliding with the
+        # current one. That is what `SkillPublisher`'s versioning is
+        # for: v1 stays active and serving traffic until someone
+        # approves v2, and rollback remains a real operation because
+        # the earlier version was never overwritten.
+        highest = (
+            await session.execute(
+                select(SkillRecord.version)
+                .where(SkillRecord.tenant_id == tenant_id)
+                .where(SkillRecord.name == manifest.name)
+                .order_by(SkillRecord.version.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        next_version = (highest or 0) + 1
+
         record = SkillRecord(
+            version=next_version,
             tenant_id=tenant_id,
             name=manifest.name,
             risk=procedure.risk,
@@ -204,7 +224,21 @@ async def register_procedure(
             supported_connectors=list(manifest.supported_connectors),
         )
         session.add(record)
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            # Two submissions of the same name racing for the same
+            # version number. Rare, and a clear conflict rather than a
+            # 500 - the caller retries and gets the next one.
+            await session.rollback()
+            raise ProcedureError(
+                (
+                    f"version {next_version} of '{manifest.name}' already exists in this "
+                    "tenant; another submission won the race - retry"
+                ),
+                skill=manifest.name,
+                reason="version_conflict",
+            ) from exc
         await session.refresh(record)
 
     active = status == SkillStatus.ACTIVE.value
