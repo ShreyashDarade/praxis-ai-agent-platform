@@ -77,6 +77,13 @@ DEFAULT_MODEL_MAPPING: dict[str, str] = {
     # strong-tier model as planning/code_synthesis, not the cheap
     # routing tier.
     "diagnosis": "claude-sonnet-5",
+    # Composing the assistant's reply from what actually ran
+    # (`praxis.agents.answer`). Strong tier deliberately: this is
+    # the text a user reads and acts on, and the failure mode of a
+    # weak model here is a fluent answer that misreads its own
+    # evidence - which is worse than no answer, because it looks
+    # exactly like a good one.
+    "answering": "claude-sonnet-5",
 }
 
 # No expiry-by-default is deliberately too aggressive for an LLM whose

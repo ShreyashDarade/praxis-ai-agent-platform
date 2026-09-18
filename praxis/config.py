@@ -23,6 +23,17 @@ class MCPServerConfig(BaseModel):
     command: str | None = None
     args: list[str] = Field(default_factory=list)
     url: str | None = None
+    # Tool names this server offers that are known-safe to call through
+    # the read-only path, for servers that do not annotate their tools.
+    #
+    # MCP lets a server declare `readOnlyHint` per tool, and when it
+    # does, that declaration is used and this list is unnecessary. When
+    # it does not, a generic "call any tool" read path would let a
+    # mutating tool bypass the Orchestrator's approval gate entirely
+    # (`query_connector` is itself risk=read_only). So an unannotated
+    # tool is refused unless an operator names it here - the decision
+    # is then explicit and visible in config rather than implicit.
+    read_only_tools: list[str] = Field(default_factory=list)
 
 
 class Settings(BaseSettings):

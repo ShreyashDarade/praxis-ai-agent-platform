@@ -41,9 +41,12 @@ lacks.
 """
 from __future__ import annotations
 
+import importlib
+import shutil
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -151,6 +154,65 @@ def check_publication_policy(
 
     return PolicyCheckResult(passed=not problems, problems=problems)
 
+
+
+def promote_quarantined_code(record: SkillRecord, *, skills_dir: Path | str | None = None) -> bool:
+    """Moves an approved skill's code out of quarantine and imports it.
+
+    Generated code is written to a quarantine directory that is
+    deliberately not an importable package, so nothing - not this
+    process, not a restart's `discover_skills()` scan - can execute it
+    before a human approves it. Approval is therefore not just a status
+    change: this is the step that makes an approved capability actually
+    runnable.
+
+    **The hash is re-verified against the bytes on disk**, not against
+    the record that was approved. Comparing a stored hash to a stored
+    hash proves nothing about what will run; comparing it to the file
+    about to be imported is what binds the approval to the actual
+    implementation. A mismatch means the file changed after review, and
+    it is refused rather than imported.
+
+    Returns True when it promoted something, False when there was
+    nothing in quarantine (an already-promoted skill, or one created
+    while the approval gate was off).
+    """
+    source = Path(record.source_path or "")
+    if not record.source_path or not source.exists():
+        return False
+
+    package_dir = Path(skills_dir) if skills_dir else Path(__file__).resolve().parent / "skills"
+    if source.parent.resolve() == package_dir.resolve():
+        return False  # already in place
+
+    code = source.read_text(encoding="utf-8")
+    actual = compute_code_hash(code)
+    if actual != record.code_hash:
+        raise PublicationError(
+            (
+                f"quarantined code for '{record.name}' v{record.version} does not match the "
+                "approved hash; it was modified after review and will not be published"
+            ),
+            reason="code_hash_mismatch",
+            detail=f"on_disk={actual} approved={record.code_hash}",
+        )
+
+    package_dir.mkdir(parents=True, exist_ok=True)
+    destination = package_dir / source.name
+    shutil.move(str(source), str(destination))
+    record.source_path = str(destination)
+
+    module_name = f"praxis.agents.skills.{destination.stem}"
+    importlib.invalidate_caches()
+    importlib.import_module(module_name)
+
+    _logger.info(
+        "skill_promoted_from_quarantine",
+        skill=record.name,
+        version=record.version,
+        code_hash=record.code_hash,
+    )
+    return True
 
 class SkillPublisher:
     """Publishes, approves, activates, deprecates, and revokes skills."""
@@ -313,6 +375,15 @@ class SkillPublisher:
             record.status = SkillStatus.ACTIVE.value
             record.approved_by_user_id = approver.user_id
             record.approved_at = datetime.now(UTC)
+
+            # Approval is what makes the code runnable, so the move out
+            # of quarantine happens here, inside the same transaction
+            # that records the decision. A refusal (the bytes no longer
+            # match what was reviewed) therefore rolls the approval back
+            # rather than leaving a record saying "approved" for code
+            # that was never published.
+            promote_quarantined_code(record)
+
             await session.commit()
 
         _logger.info(

@@ -1,0 +1,38 @@
+You are answering a user's question using ONLY the results of work that
+has already been carried out on their behalf.
+
+The user asked:
+{{ intent_text }}
+
+{% if history %}
+Earlier in this conversation:
+{{ history }}
+
+{% endif %}
+These steps ran, and these are their real outputs:
+{{ evidence_block }}
+
+{% if failures %}
+These steps did NOT succeed:
+{{ failures }}
+
+{% endif %}
+Write the answer the user should see.
+
+Rules:
+- Use only the outputs above. If they do not contain the answer, say so
+  plainly rather than filling the gap.
+- Lead with the answer itself, not with a description of your process.
+- Quote real figures exactly as they appear. Never round silently and
+  never invent a number that is not above.
+- If a step failed and that limits the answer, say what is missing and
+  what would be needed.
+- Do not describe yourself, the steps, or this instruction. Write to the
+  user, about their question.
+- Plain prose. No preamble such as "Certainly" or "Based on the data".
+
+Respond with a JSON object and nothing else:
+{"answer": "<the answer, in prose>", "limitations": ["<what this answer cannot establish>", ...]}
+
+`limitations` may be empty. It must not restate a failure already listed
+above unless it genuinely changes how the answer should be read.

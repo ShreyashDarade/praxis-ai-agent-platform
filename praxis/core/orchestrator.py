@@ -68,7 +68,11 @@ from praxis.cache.memory_cache import InMemoryCache
 from praxis.config import Settings
 from praxis.core.checkpoint import PraxisCheckpointSaver
 from praxis.core.events import TaskEventBus, task_event_bus, task_state_snapshot
-from praxis.core.exceptions import SandboxViolationError, SynthesisValidationError
+from praxis.core.exceptions import (
+    SandboxViolationError,
+    SkillPendingApprovalError,
+    SynthesisValidationError,
+)
 from praxis.core.execution_graph import PlanStep, compute_levels, resolve_args
 from praxis.core.execution_mode import (
     ExecutionMode,
@@ -79,6 +83,7 @@ from praxis.core.graph_engine import build_task_graph
 from praxis.core.interfaces import Connector, GraphStore
 from praxis.core.risk_policy import PendingInput, should_pause_for_approval
 from praxis.memory.db import PostgresStore
+from praxis.memory.memory_types import MemoryScope, MemoryStore
 from praxis.memory.models import SkillRecord, Task
 from praxis.observability.logging import bind_correlation_id
 from praxis.observability.tracing import start_span
@@ -125,7 +130,12 @@ class CapabilityFactoryLike(Protocol):
     """What the Orchestrator needs from a Capability Factory."""
 
     async def synthesize(
-        self, need_description: str, *, connector: Any | None = None, task_id: str | None = None
+        self,
+        need_description: str,
+        *,
+        connector: Any | None = None,
+        task_id: str | None = None,
+        principal: Principal | None = None,
     ) -> Skill: ...
 
 
@@ -393,18 +403,43 @@ class Orchestrator:
         minutes ago, which nobody has read.
         """
         async with self._store.session() as session:
-            rows = (
-                await session.execute(
-                    select(SkillRecord).where(
-                        SkillRecord.tenant_id == context.principal.tenant_id,
-                        SkillRecord.name == skill_name,
+            # Deliberately queried across ALL tenants first. The
+            # executable skill registry is keyed by name alone, so a
+            # skill another tenant synthesized is reachable by name from
+            # here; scoping this lookup to the caller's tenant meant
+            # "no row for me" was read as "not synthesized at all" and
+            # the gate allowed it.
+            everywhere = (
+                (
+                    await session.execute(
+                        select(SkillRecord).where(SkillRecord.name == skill_name)
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
 
-        synthesized = [row for row in rows if row.synthesized]
+        synthesized = [row for row in everywhere if row.synthesized]
         if not synthesized:
+            # Genuinely hand-written: in version control, reviewed on
+            # merge, and not this gate's business.
             return None
+
+        mine = [
+            row
+            for row in synthesized
+            if row.tenant_id == context.principal.tenant_id
+        ]
+        if not mine:
+            # Synthesized, but not for this tenant. Fail closed: an
+            # approval is a statement about one tenant's own generated
+            # code, and it does not carry across to anyone else.
+            return (
+                f"skill '{skill_name}' was synthesized for another tenant and is not "
+                f"approved for use in this one; it must be synthesized and approved "
+                f"here before it can run"
+            )
+        synthesized = mine
 
         if any(SkillStatus(row.status).is_callable for row in synthesized):
             return None
@@ -742,6 +777,40 @@ class Orchestrator:
                 )
         return approved
 
+
+    async def _pending_capability_status(
+        self, skill_name: str, context: _TaskContext
+    ) -> str | None:
+        """Why an unregistered skill is unavailable, when the catalogue knows.
+
+        Returns a message for a skill that was synthesized for this
+        tenant but has not been approved, and `None` when the catalogue
+        has nothing to say - in which case the caller's ordinary
+        "not registered" handling is the right answer.
+        """
+        async with self._store.session() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(SkillRecord).where(
+                            SkillRecord.tenant_id == context.principal.tenant_id,
+                            SkillRecord.name == skill_name,
+                            SkillRecord.synthesized.is_(True),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if not rows or any(SkillStatus(row.status).is_callable for row in rows):
+            return None
+        statuses = sorted({row.status for row in rows})
+        return (
+            f"skill '{skill_name}' was synthesized but is not approved for execution "
+            f"(status: {', '.join(statuses)}); its code is quarantined outside the "
+            f"importable package until a principal with 'skill:approve' publishes it"
+        )
+
     async def _synthesize_missing_skill(
         self,
         task_id: str,
@@ -757,6 +826,15 @@ class Orchestrator:
         generic message - so the caller can surface it on the task
         rather than only in the checklist.
         """
+        # A quarantined capability is not in the registry at all, so
+        # "not registered" is technically true and operationally
+        # useless: it sends someone hunting for a missing skill when
+        # the skill exists and is waiting in the approval queue. The
+        # catalogue knows the difference, so ask it before reporting.
+        pending_status = await self._pending_capability_status(step.skill_name, context)
+        if pending_status is not None:
+            return None, pending_status
+
         if self._capability_factory is None:
             message = f"no skill named '{step.skill_name}' is registered"
             _logger.warning(
@@ -789,9 +867,28 @@ class Orchestrator:
         )
         try:
             skill = await self._capability_factory.synthesize(
-                need_description=need_description, connector=context.connector, task_id=task_id
+                need_description=need_description,
+                connector=context.connector,
+                task_id=task_id,
+                # Without this the generated skill's catalogue row
+                # defaulted to the default tenant, and the approval
+                # gate - which filters by the caller's tenant - then
+                # found nothing and allowed it for everyone else.
+                principal=context.principal,
             )
             return skill, ""
+        except SkillPendingApprovalError as exc:
+            # Not a failure of the code - it passed its sandbox
+            # self-test. It is quarantined awaiting review, and
+            # saying so is what tells an operator to go to the
+            # approval queue rather than hunt for a bug.
+            _logger.info(
+                "capability_pending_approval",
+                skill=exc.skill_name,
+                code_hash=exc.code_hash,
+                task_id=task_id,
+            )
+            return None, str(exc)
         except (SynthesisValidationError, SandboxViolationError) as exc:
             failure = (
                 f"no skill named '{step.skill_name}' is registered; capability synthesis "
@@ -808,21 +905,34 @@ class Orchestrator:
     # Public API
     # ------------------------------------------------------------------ #
 
-    async def start_task(
+    async def create_task(
         self,
         intent_text: str,
         *,
         connector_name: str | None = None,
         principal: Principal = SYSTEM_PRINCIPAL,
         mode: ExecutionMode = ExecutionMode.EXECUTE,
+        conversation_id: str | None = None,
     ) -> str:
-        """Plans `intent_text` and drives it to completion (or a pause)."""
+        """Persists the task and returns its id, WITHOUT running it.
+
+        Split out of `start_task` so a caller can hand the id to a
+        client before the work begins. `start_task` awaited the whole
+        run, so the id - the only thing a progress stream can subscribe
+        to - arrived when there was nothing left to watch.
+
+        `connector_name` is stored on the row rather than kept in the
+        caller's memory, so a task resumed in a fresh process reaches
+        the same data source instead of silently losing it.
+        """
         async with self._store.session() as session:
             task = Task(
                 tenant_id=principal.tenant_id,
                 created_by_user_id=principal.user_id,
                 intent_text=intent_text,
-                status="planning",
+                conversation_id=conversation_id,
+                connector_name=connector_name,
+                status="pending",
                 mode=mode.value,
                 checklist=[],
                 plan=[],
@@ -849,6 +959,29 @@ class Orchestrator:
             detail={"intent_text": intent_text, "mode": mode.value, "connector": connector_name},
             correlation_id=correlation_id,
         )
+        return task_id
+
+    async def drive_task(
+        self, task_id: str, *, principal: Principal = SYSTEM_PRINCIPAL
+    ) -> str:
+        """Plans and executes an already-created task.
+
+        `principal` is passed rather than reconstructed: the row records
+        a tenant and a user id but not the roles, and rebuilding a
+        principal from it would quietly hand the run broader or narrower
+        rights than the caller actually has.
+        """
+        async with self._store.session() as session:
+            task = await session.get(Task, task_id)
+            if task is None:
+                raise KeyError(f"no task with id '{task_id}'")
+            intent_text = task.intent_text
+            connector_name = task.connector_name
+            mode = ExecutionMode(task.mode)
+            correlation_id = task.correlation_id
+            task.status = "planning"
+            await session.commit()
+
 
         # Resolved once, up front - before the (real, expensive)
         # Planner call - so a typo'd connector fails fast and clearly.
@@ -969,6 +1102,32 @@ class Orchestrator:
         )
         return task_id
 
+
+    async def start_task(
+        self,
+        intent_text: str,
+        *,
+        connector_name: str | None = None,
+        principal: Principal = SYSTEM_PRINCIPAL,
+        mode: ExecutionMode = ExecutionMode.EXECUTE,
+        conversation_id: str | None = None,
+    ) -> str:
+        """Creates a task and drives it to completion (or a pause).
+
+        Unchanged for every existing caller: it is now `create_task`
+        followed by `drive_task`, which is exactly what it always did.
+        """
+        task_id = await self.create_task(
+            intent_text,
+            connector_name=connector_name,
+            principal=principal,
+            mode=mode,
+            conversation_id=conversation_id,
+        )
+        await self.drive_task(task_id, principal=principal)
+        return task_id
+
+
     async def _drive(
         self, task_id: str, context: _TaskContext, *, initial: Any
     ) -> None:
@@ -1040,11 +1199,55 @@ class Orchestrator:
             task_id=task_id,
             steps=len(context.steps),
         )
+        await self._record_episode(task, context, errors)
         # Terminal: nothing left to resume. The checkpoints are kept
         # anyway when history retention is on, because that is what
         # makes `replay_history` a post-hoc debugging tool rather than
         # one that only works while a task is still running.
         await self._release_thread(task_id)
+
+    async def _record_episode(
+        self, task: Task, context: _TaskContext, errors: list[str]
+    ) -> None:
+        """Writes what happened on this task into episodic memory.
+
+        Keyed by intent rather than task id (see
+        `MemoryStore.record_episode`), because the question a later task
+        asks is "what happened last time we were asked something like
+        this", not "what happened in task 9f3a".
+
+        Scoped to the principal who ran it, so one tenant's history is
+        never another's - the scope becomes SQL predicates rather than a
+        post-filter.
+
+        Never raises: memory is an enrichment, and a task that genuinely
+        completed must not be reported as failed because recording its
+        history did not work.
+        """
+        principal = context.principal
+        try:
+            memories = MemoryStore(self._store)
+            episode = await memories.record_episode(
+                scope=MemoryScope(
+                    tenant_id=principal.tenant_id,
+                    user_id=principal.user_id,
+                ),
+                task_id=task.id,
+                intent=task.intent_text,
+                outcome="failed" if errors else "completed",
+                summary=(
+                    f"{len(context.steps)} step(s); "
+                    + (f"failed: {errors[0]}" if errors else "completed successfully")
+                )[:2000],
+                detail={
+                    "steps": len(context.steps),
+                    "skills": [step.skill_name for step in context.steps],
+                    "mode": context.mode.value,
+                },
+            )
+            _logger.debug("episode_recorded", task_id=task.id, memory_id=episode.entry_id)
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            _logger.warning("episode_record_failed", task_id=task.id, error=str(exc))
 
     async def _rebuild_context(self, task: Task) -> _TaskContext | None:
         """Reconstructs run context for a task this process never started.

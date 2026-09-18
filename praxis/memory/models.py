@@ -199,6 +199,16 @@ class Task(Base):
     created_by_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     correlation_id: Mapped[str] = mapped_column(String(36), default=_uuid)
     intent_text: Mapped[str] = mapped_column(Text)
+    # The conversation turn that produced this task, when it came
+    # from chat rather than a standalone `POST /intent`. Nullable so
+    # every existing caller is unchanged.
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    # Which connector this task runs against, persisted rather than
+    # held in the starting process's memory - a task resumed after a
+    # restart must reach the same data source, not lose it.
+    connector_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     # Phase 13: which execution mode this task runs under
     # (`praxis.core.execution_mode.ExecutionMode`) - `execute` is the
@@ -527,3 +537,70 @@ class GraphEdge(Base):
     target: Mapped[str] = mapped_column(String(512), index=True)
     edge_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class Conversation(Base):
+    """A continuing exchange between one user and Praxis.
+
+    The unit a follow-up attaches to. Without it every request starts
+    from zero, so "now group that by region" is a brand-new plan with no
+    idea what "that" refers to - which is the single largest gap between
+    a task runner and the conversational commander the brief describes.
+
+    Deliberately thin: the conversation owns identity, ownership and
+    lifecycle, while everything said lives in `Message` rows. That keeps
+    a long exchange from rewriting one ever-growing row on every turn,
+    and lets history be paged rather than loaded whole.
+    """
+
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    # Who owns it. A conversation is private to its creator: two users
+    # in one tenant do not share each other's threads.
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    # Which connector this thread is about, when the user picked one, so
+    # follow-ups do not have to name it again.
+    connector_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class Message(Base):
+    """One turn: what the user said, or what Praxis answered.
+
+    `role` is `user` | `assistant` | `system`, matching the shape every
+    chat client already expects.
+
+    An assistant message carries more than prose. `evidence` records
+    what the answer was actually derived from (which skill, which step,
+    which artifact), and `limitations` records what it could not
+    establish - both required by the brief, and both the difference
+    between an answer a reader can check and one they must simply
+    believe. They are columns rather than prose inside `content` so a
+    client can render citations without parsing English.
+    """
+
+    __tablename__ = "messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, default=DEFAULT_TENANT_ID)
+    conversation_id: Mapped[str] = mapped_column(String(36), index=True)
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(Text, default="")
+    # The task this turn produced (user message) or reported on
+    # (assistant message), when there was one.
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # Attachment ids the user explicitly scoped this turn to, so "these
+    # invoices" means those files rather than a similarity search over
+    # everything the tenant has ever uploaded.
+    attachment_ids: Mapped[list] = mapped_column(JSON, default=list)
+    evidence: Mapped[list] = mapped_column(JSON, default=list)
+    limitations: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, index=True
+    )

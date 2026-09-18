@@ -63,6 +63,7 @@ class MCPConnector(Connector):
         args: list[str] | None = None,
         url: str | None = None,
         read_only: bool = True,
+        read_only_tools: list[str] | None = None,
     ) -> None:
         if command and url:
             raise ValueError(
@@ -78,6 +79,10 @@ class MCPConnector(Connector):
         self._command = command
         self._args = list(args) if args else []
         self._url = url
+        self._declared_read_only = frozenset(read_only_tools or ())
+        # Populated from the server's own tool annotations on first
+        # use, then reused: risk must not cost a round trip per call.
+        self._read_only_hints: dict[str, bool] | None = None
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[ClientSession]:
@@ -111,8 +116,42 @@ class MCPConnector(Connector):
             kind="mcp", schema={"tools": [tool.name for tool in result.tools]}
         )
 
+    async def _tool_is_read_only(self, tool: str) -> bool:
+        """Whether `tool` may be invoked through the read-only path.
+
+        Order of authority: the operator's explicit allowlist, then the
+        server's own `readOnlyHint` annotation. An unannotated,
+        unlisted tool is **not** read-only.
+
+        Failing closed is the whole point. `query_connector` is itself
+        declared `risk="read_only"`, so anything reachable through
+        `read()` skips the Orchestrator's mutating-step approval gate.
+        Treating "the server did not say" as "safe" would make that gate
+        optional for every MCP server that omits annotations.
+        """
+        if tool in self._declared_read_only:
+            return True
+        if self._read_only_hints is None:
+            async with self._session() as session:
+                listed = await session.list_tools()
+            self._read_only_hints = {
+                t.name: bool(getattr(t.annotations, "readOnlyHint", False))
+                for t in listed.tools
+            }
+        return self._read_only_hints.get(tool, False)
+
     async def read(self, query: str, **params: Any) -> Any:
         """``query`` is an MCP tool name; ``params`` are that tool's arguments."""
+        # Checked BEFORE the session opens, for two reasons: a refused
+        # call should not connect at all, and an exception raised inside
+        # the session's task group comes back wrapped in an
+        # ExceptionGroup, which no caller would think to catch.
+        if self.read_only and not await self._tool_is_read_only(query):
+            raise PermissionError(
+                f"connector '{self.name}' is registered read-only and tool "
+                f"'{query}' is not declared read-only by the server; add it to "
+                f"this server's 'read_only_tools' if it genuinely only reads"
+            )
         async with self._session() as session:
             result = await session.call_tool(query, params)
         return _unwrap(result)
@@ -120,12 +159,17 @@ class MCPConnector(Connector):
     async def write(self, action: str, **params: Any) -> Any:
         if self.read_only:
             raise PermissionError(f"connector '{self.name}' is registered read-only")
+        # Past the read_only gate this is a write connector, so the
+        # per-tool read-only check in `read()` must not also apply here -
+        # invoking a mutating tool is the entire purpose of this path.
         # For a fully generic MCP server there is no structural difference
         # between a "read" tool and a "write" tool - which tool names a
         # task's risk tier permits is a Praxis-side policy decision, not
         # something this connector can distinguish. Once past the
         # read_only gate, invoking a tool is mechanically identical.
-        return await self.read(action, **params)
+        async with self._session() as session:
+            result = await session.call_tool(action, params)
+        return _unwrap(result)
 
     async def health(self) -> HealthStatus:
         try:

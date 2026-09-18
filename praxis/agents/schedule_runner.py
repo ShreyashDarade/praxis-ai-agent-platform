@@ -52,6 +52,7 @@ from praxis.agents.schedules import (
     run_idempotency_key,
     should_start_run,
 )
+from praxis.core.dead_letter import DeadLetterQueue
 from praxis.memory.models import ScheduleRecord, ScheduleRun
 
 _logger = structlog.get_logger(__name__)
@@ -184,6 +185,7 @@ async def poll_once(
     *,
     now: datetime | None = None,
     limit: int = 100,
+    dead_letters: DeadLetterQueue | None = None,
 ) -> PollResult:
     """Finds every due schedule, fires what should fire, advances the rest.
 
@@ -191,6 +193,12 @@ async def poll_once(
     not start. Commits once at the end: every row this touched moves
     together, so a crash mid-poll leaves slots unclaimed and re-pollable
     rather than half-advanced.
+
+    `dead_letters`, when supplied, receives every launch failure so a
+    schedule that failed unattended is discoverable and retryable rather
+    than only a `failed` row in a table nobody reads. Optional so a
+    caller that has no store - or a test asserting only scheduling
+    behaviour - is unaffected.
     """
     now = now or datetime.now(UTC)
     result = PollResult()
@@ -262,6 +270,31 @@ async def poll_once(
                 run.status = RUN_FAILED
                 run.detail = f"{type(exc).__name__}: {exc}"
                 run.finished_at = datetime.now(UTC)
+                # The failure goes to the dead-letter queue, not just
+                # into a `failed` row nobody reads. A schedule fires on
+                # its own cadence with nobody watching, so "the Monday
+                # report did not run" has to be discoverable on Tuesday
+                # and retryable - which is exactly what the DLQ's
+                # bounded retries, backoff and failure history provide.
+                #
+                # Keyed by (schedule, slot) so repeated failures of the
+                # same slot accumulate attempts on one entry rather than
+                # producing a row per attempt: "timed out twice then
+                # failed auth" is a different diagnosis from "failed
+                # auth", and only the history tells them apart.
+                if dead_letters is not None:
+                    await dead_letters.record_failure(
+                        tenant_id=schedule.tenant_id,
+                        job_type="schedule",
+                        job_key=run_idempotency_key(schedule.schedule_id, scheduled_for),
+                        payload={
+                            "schedule_id": schedule.schedule_id,
+                            "schedule_name": schedule.name,
+                            "intent_text": schedule.intent_text,
+                            "scheduled_for": scheduled_for.isoformat(),
+                        },
+                        error=exc,
+                    )
                 result.slots.append(
                     FiredSlot(
                         schedule_id=record.id,

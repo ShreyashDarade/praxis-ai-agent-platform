@@ -344,6 +344,11 @@ timeout = 90
 # hand - the point of stating it is that it stops being a convention
 # people remember and starts being a rule a tool enforces.
 [tool.ruff]
+# Quarantined LLM-generated capabilities awaiting approval. Not
+# this codebase's code, never imported, and deleted on approval
+# (it moves into the skills package). Linting it would report
+# findings about a model's output that nobody can act on.
+extend-exclude = ["praxis/agents/_quarantine"]
 line-length = 100
 target-version = "py311"
 

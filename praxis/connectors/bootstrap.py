@@ -164,6 +164,7 @@ def build_registry(settings: Settings) -> ConnectorRegistry:
                 command=server.command,
                 args=server.args,
                 url=server.url,
+                read_only_tools=server.read_only_tools,
             )
         )
     return registry

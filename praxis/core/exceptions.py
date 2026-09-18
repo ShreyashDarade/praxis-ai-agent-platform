@@ -133,3 +133,23 @@ class ApprovalTimeoutError(Exception):
         self.task_id = task_id
         self.waited_seconds = waited_seconds
         self.detail = detail
+
+
+class SkillPendingApprovalError(Exception):
+    """A capability was synthesized but may not run yet.
+
+    Distinct from `SynthesisValidationError`: the code is *fine* - it
+    passed its sandbox self-test - it simply has not been approved. A
+    caller that conflated the two would report a working capability as
+    broken, and an operator would go looking for a bug instead of an
+    approval queue.
+
+    The code lives in quarantine, outside any importable package, so
+    neither this process nor a restart can execute it before a human
+    with `skill:approve` publishes that exact `code_hash`.
+    """
+
+    def __init__(self, message: str, *, skill_name: str, code_hash: str) -> None:
+        super().__init__(message)
+        self.skill_name = skill_name
+        self.code_hash = code_hash

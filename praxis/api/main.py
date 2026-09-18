@@ -28,6 +28,7 @@ from sqlalchemy import select
 
 from praxis.agents import skill_registry
 from praxis.agents.capability_factory import CapabilityFactory
+from praxis.agents.conversation import ConversationService
 from praxis.agents.planner import Planner
 from praxis.agents.scheduler import Scheduler
 from praxis.agents.subagent import discover_agents
@@ -370,6 +371,30 @@ def _get_orchestrator() -> Orchestrator:
     return _orchestrator
 
 
+_conversation_service: ConversationService | None = None
+
+
+def get_conversation_service() -> ConversationService:
+    """The shared chat service, built over the same Orchestrator.
+
+    One instance per process because it holds the in-flight turn set:
+    a per-request service would let Python garbage-collect a running
+    turn the moment the request that started it returned, which is the
+    exact failure `asyncio.create_task` has without a retained handle.
+    """
+    global _conversation_service
+    if _conversation_service is None:
+        from praxis.agents.conversation import ConversationService
+
+        _conversation_service = ConversationService(
+            PostgresStore(Settings()),
+            _get_orchestrator(),
+            catalogue=LLMCatalogue(),
+            prompt_manager=PromptManager(),
+        )
+    return _conversation_service
+
+
 # Route modules are imported (and their routers included) last, after
 # every singleton/helper function above is defined - each of
 # `praxis.api.routes.{health,attachments,tasks}` does `from praxis.api
@@ -382,6 +407,7 @@ def _get_orchestrator() -> Orchestrator:
 from praxis.api.routes import (  # noqa: E402
     admin,
     attachments,
+    conversations,
     dashboards,
     health,
     schedules,
@@ -394,6 +420,7 @@ app.include_router(tasks.router)
 app.include_router(admin.router)
 app.include_router(dashboards.router)
 app.include_router(schedules.router)
+app.include_router(conversations.router)
 
 
 async def _bootstrap_default_tenant() -> None:

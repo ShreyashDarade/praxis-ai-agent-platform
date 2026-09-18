@@ -27,3 +27,9 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# LLM-generated capabilities awaiting human approval
+# (praxis.agents.capability_factory). Deliberately outside the
+# importable skills package so neither a running process nor a
+# restart can execute unapproved code; never committed.
+praxis/agents/_quarantine/

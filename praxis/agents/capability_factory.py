@@ -50,11 +50,13 @@ self-contained, with zero network and zero host-filesystem dependency.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import inspect
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -69,13 +71,16 @@ from praxis.cache import scopes
 from praxis.cache.keys import CacheKey
 from praxis.cache.memory_cache import InMemoryCache
 from praxis.connectors.retry import call_with_retry
-from praxis.core.exceptions import SynthesisValidationError
+from praxis.core.exceptions import (
+    SkillPendingApprovalError,
+    SynthesisValidationError,
+)
 from praxis.core.interfaces import Cache, Connector, SandboxExecutor
 from praxis.llm.catalogue import LLMCatalogue
 from praxis.llm.prompt_manager import PromptManager
 from praxis.memory.db import PostgresStore
 from praxis.memory.graph_store import PgGraphStore
-from praxis.memory.models import SkillRecord
+from praxis.memory.models import DEFAULT_TENANT_ID, SkillRecord
 from praxis.observability.tracing import start_span
 from praxis.security.principal import Principal
 
@@ -137,6 +142,65 @@ _RESPONSE_RE = re.compile(
 _NAME_ATTR_RE = re.compile(r"^\s*name\s*(?::[^=]+)?=\s*(['\"])(?P<name>[^'\"]+)\1", re.MULTILINE)
 
 _SLUG_INVALID_RE = re.compile(r"[^a-z0-9_]+")
+
+
+@dataclass(frozen=True)
+class _StaticSkillMetadata:
+    """A generated skill's declared shape, read WITHOUT importing it.
+
+    Importing a module executes every statement at its top level, so
+    reading metadata by import would run generated code in the API
+    process before any human approved it - which is exactly the control
+    the approval gate exists to provide. `ast.parse` builds the tree
+    without executing anything, and `literal_eval` refuses anything that
+    is not a plain literal, so a `name` computed by calling out to the
+    network simply fails to parse rather than running.
+    """
+
+    name: str
+    risk: str
+    inputs: dict[str, str]
+    outputs: dict[str, str]
+    docstring: str
+
+
+def _extract_skill_metadata(module_code: str) -> _StaticSkillMetadata:
+    """Reads the generated `Skill` subclass's declared attributes statically."""
+    tree = ast.parse(module_code)
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        attrs: dict[str, Any] = {}
+        for stmt in node.body:
+            target: ast.expr | None = None
+            value: ast.expr | None = None
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                target, value = stmt.targets[0], stmt.value
+            elif isinstance(stmt, ast.AnnAssign):
+                target, value = stmt.target, stmt.value
+            if not isinstance(target, ast.Name) or value is None:
+                continue
+            if target.id not in ("name", "risk", "inputs", "outputs"):
+                continue
+            try:
+                attrs[target.id] = ast.literal_eval(value)
+            except ValueError:
+                # Not a literal. Treated as absent rather than trusted -
+                # a computed attribute is precisely what must not run.
+                continue
+        if "name" in attrs:
+            return _StaticSkillMetadata(
+                name=str(attrs["name"]),
+                risk=str(attrs.get("risk", "mutating")),
+                inputs={str(k): str(v) for k, v in dict(attrs.get("inputs", {})).items()},
+                outputs={str(k): str(v) for k, v in dict(attrs.get("outputs", {})).items()},
+                docstring=next(iter((ast.get_docstring(node) or '').splitlines()), ''),
+            )
+    raise SynthesisValidationError(
+        "the generated module declares no Skill subclass with a `name` attribute",
+        code=module_code,
+        detail="static analysis found no class with a literal `name` class attribute",
+    )
 
 
 def _read_source(module: Any) -> str:
@@ -346,6 +410,11 @@ class CapabilityFactory:
         self._graph_store = graph_store
         self._store = store
         self._skills_dir = Path(skills_dir)
+        # Deliberately a sibling of the skills package, not inside
+        # it: anything under `praxis/agents/skills/` is importable
+        # and would be picked up by `discover_skills()` on the next
+        # restart, which is precisely what quarantine must prevent.
+        self._quarantine_dir = Path(skills_dir).parent / "_quarantine"
         self._sandbox_timeout_seconds = sandbox_timeout_seconds
         self._schema_cache: Cache = schema_cache if schema_cache is not None else InMemoryCache()
         self._schema_cache_ttl_seconds = schema_cache_ttl_seconds
@@ -449,7 +518,14 @@ class CapabilityFactory:
                         "synthesis_attempt_succeeded", attempt=attempt, max_attempts=_MAX_ATTEMPTS,
                         task_id=task_id,
                     )
-                    return await self._register(module_code, connector=connector, task_id=task_id)
+                    return await self._register(
+                        module_code,
+                        connector=connector,
+                        task_id=task_id,
+                        tenant_id=(
+                            principal.tenant_id if principal is not None else DEFAULT_TENANT_ID
+                        ),
+                    )
 
                 last_code = module_code
                 last_detail = (
@@ -561,11 +637,31 @@ class CapabilityFactory:
     # ------------------------------------------------------------------ #
 
     async def _register(
-        self, module_code: str, *, connector: Connector | None, task_id: str | None
+        self,
+        module_code: str,
+        *,
+        connector: Connector | None,
+        task_id: str | None,
+        tenant_id: str = DEFAULT_TENANT_ID,
     ) -> Skill:
         skill_name = _extract_skill_name(module_code)
         module_name = f"synthesized_{_slugify(skill_name)}"
-        file_path = self._skills_dir / f"{module_name}.py"
+
+        # The generated module's declared shape, read WITHOUT importing
+        # it. See `_extract_skill_metadata`: importing would execute the
+        # generated code in this process before anyone approved it.
+        metadata = _extract_skill_metadata(module_code)
+
+        # Where the code lands depends entirely on whether it may run.
+        #
+        # Under the approval gate it goes to a quarantine directory that
+        # is deliberately NOT an importable package, so neither this
+        # call nor `discover_skills()` on the next restart can import
+        # it. Only an approval moves it into the skills package.
+        quarantined = self._require_approval
+        target_dir = self._quarantine_dir if quarantined else self._skills_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / f"{module_name}.py"
         file_path.write_text(module_code, encoding="utf-8")
 
         # `self._skills_dir` is expected to be the real
@@ -574,10 +670,15 @@ class CapabilityFactory:
         # - the dotted import path below assumes exactly that, which is
         # also what makes `discover_skills()`'s future package scan pick
         # this file up on a cold restart with zero code changes.
-        dotted_module = f"praxis.agents.skills.{module_name}"
-        importlib.import_module(dotted_module)
-
-        registered_skill = skill_registry.get_skill(skill_name)
+        registered_skill: Skill | None = None
+        if not quarantined:
+            # Only reached when this deployment has deliberately turned
+            # the approval gate off, which is the one case where running
+            # generated code without review is a configured choice
+            # rather than an accident.
+            dotted_module = f"praxis.agents.skills.{module_name}"
+            importlib.import_module(dotted_module)
+            registered_skill = skill_registry.get_skill(skill_name)
 
         # Phase 21 (Prompt §7: "require approval before
         # publishing/enabling it"). The catalogue row's status decides
@@ -603,15 +704,23 @@ class CapabilityFactory:
         async with self._store.session() as session:
             session.add(
                 SkillRecord(
+                    # Bound to the tenant that asked for it. Without
+                    # this the row defaulted to the default tenant, and
+                    # `_approval_gate_blocks` - which filters by the
+                    # caller's tenant - found no row for any OTHER
+                    # tenant and allowed the call through. A pending
+                    # skill was therefore ungated for every tenant
+                    # except the one it was created in.
+                    tenant_id=tenant_id,
                     name=skill_name,
-                    risk=registered_skill.risk,
+                    risk=metadata.risk,
                     synthesized=True,
                     status=status,
-                    inputs_schema=dict(registered_skill.inputs),
-                    outputs_schema=dict(registered_skill.outputs),
+                    inputs_schema=dict(metadata.inputs),
+                    outputs_schema=dict(metadata.outputs),
                     code_hash=compute_code_hash(module_code),
                     source_path=str(file_path),
-                    description=(registered_skill.__doc__ or "").strip().split("\n")[0],
+                    description=metadata.docstring,
                 )
             )
             await session.commit()
@@ -635,4 +744,14 @@ class CapabilityFactory:
                 source=skill_name, relation=_BUILT_AGAINST_RELATION, target=connector.name
             )
 
+        if registered_skill is None:
+            # Quarantined: there is deliberately nothing runnable to
+            # return. The caller surfaces this as a pending-approval
+            # step failure rather than executing anything.
+            raise SkillPendingApprovalError(
+                f"skill '{skill_name}' is quarantined pending approval; an approver "
+                f"holding 'skill:approve' must publish it before it can run",
+                skill_name=skill_name,
+                code_hash=compute_code_hash(module_code),
+            )
         return registered_skill

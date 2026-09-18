@@ -29,7 +29,7 @@ from praxis.config import Settings
 from praxis.ingestion.tables import TABLE_NAME, describe_uploaded_table, query_table
 from praxis.memory.blob_store import LocalBlobStore
 from praxis.memory.db import PostgresStore
-from praxis.memory.models import Attachment
+from praxis.memory.models import DEFAULT_TENANT_ID, Attachment
 
 
 class QueryTableSkill(Skill):
@@ -56,13 +56,30 @@ class QueryTableSkill(Skill):
     async def run(self, **kwargs: Any) -> Any:
         attachment_id = kwargs["attachment_id"]
         sql = (kwargs.get("sql") or "").strip()
+        # Injected by the Orchestrator on every skill call, never by the
+        # model. A skill that trusted a model-supplied tenant would be
+        # taking the attacker's word for who is asking.
+        tenant_id = kwargs.get("tenant_id") or DEFAULT_TENANT_ID
 
         settings = Settings()
         db = PostgresStore(settings)
         try:
             async with db.session() as session:
                 attachment = await session.get(Attachment, attachment_id)
-                if attachment is None:
+                # Tenancy is checked HERE, before a single byte is read.
+                #
+                # The blob store is keyed by a bare attachment id, so
+                # possession of an id was previously enough to read
+                # another tenant's spreadsheet through this tool - every
+                # other retrieval path (the API routes, the vector
+                # store) filters by tenant, and this one did not.
+                #
+                # "Not yours" and "does not exist" raise the identical
+                # error on purpose: distinguishing them would confirm
+                # that an id exists in some other tenant, which is the
+                # same existence oracle the API's 404-not-403 rule
+                # exists to deny.
+                if attachment is None or attachment.tenant_id != tenant_id:
                     raise KeyError(f"no attachment with id '{attachment_id}'")
                 mime_type = attachment.mime_type
         finally:
