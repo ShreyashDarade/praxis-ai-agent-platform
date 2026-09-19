@@ -265,3 +265,4 @@ def redis_cache_from_settings(settings: Any) -> RedisCache | None:
     if not url:
         return None
     return RedisCache(url, namespace=getattr(settings, "redis_namespace", "praxis"))
+

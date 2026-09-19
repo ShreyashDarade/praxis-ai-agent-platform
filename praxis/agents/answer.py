@@ -226,3 +226,4 @@ def _strip_fence(raw: str) -> str:
         if text.rstrip().endswith("```"):
             text = text.rstrip()[: -len("```")]
     return text.strip()
+

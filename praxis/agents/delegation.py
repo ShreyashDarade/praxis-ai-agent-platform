@@ -307,3 +307,4 @@ def aggregate_results(outcomes: list[Any]) -> dict[str, Any]:
         "errors": failed,
         "partial": bool(succeeded) and bool(failed),
     }
+

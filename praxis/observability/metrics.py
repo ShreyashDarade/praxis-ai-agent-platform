@@ -247,3 +247,4 @@ def cache_hit_rate(scope: str) -> float | None:
     if total == 0:
         return None
     return hits / total
+
