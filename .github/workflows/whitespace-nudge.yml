@@ -1,0 +1,68 @@
+name: whitespace nudge
+
+# Touches the trailing whitespace of a few files and commits the result.
+#
+# The only hard requirement is that it must never break the codebase, so
+# the edit it makes is the smallest one that is still a real diff - the
+# number of newlines at end of file, toggled between one and two - and
+# nothing is committed until every tracked Python file has been re-parsed
+# successfully. If any file fails to parse the run reverts itself and
+# fails loudly rather than pushing something broken.
+#
+# Toggling (rather than appending) keeps it bounded: a file oscillates
+# between one and two trailing newlines forever instead of growing a
+# blank line per run.
+
+on:
+  schedule:
+    # 09:15 UTC daily. Cron on GitHub is best-effort and can be delayed
+    # under load; this is not a job anything depends on being punctual.
+    - cron: "15 9 * * *"
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "How many files to touch"
+        required: false
+        default: "5"
+
+# Least privilege: this job writes commits and nothing else.
+permissions:
+  contents: write
+
+concurrency:
+  # Two overlapping runs would race on the same branch and one would be
+  # rejected on push; serialising them is simpler than retrying.
+  group: whitespace-nudge
+  cancel-in-progress: false
+
+jobs:
+  nudge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the push is a fast-forward on a real branch
+          # rather than a detached-HEAD dead end.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Touch trailing whitespace on a few files
+        id: touch
+        env:
+          COUNT: ${{ github.event.inputs.count || '5' }}
+        run: python .github/scripts/whitespace_nudge.py "$COUNT"
+
+      - name: Commit and push
+        if: steps.touch.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: whitespace nudge
+
+          Touched ${{ steps.touch.outputs.files }} file(s); every tracked
+          Python file re-parsed cleanly before this was committed."
+          git push
