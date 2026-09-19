@@ -353,7 +353,7 @@ layer is untouched.
 | `praxis/analytics/` | Dashboard spec, validation, rendering, refresh |
 | `praxis/semantic/` | Metrics, dimensions, joins, grain validation |
 | `praxis/llm/` | Provider routing, catalogue, prompts |
-| `migrations/` | Alembic revisions |
+| `praxis/migrations/` | Alembic revisions, shipped as package data |
 
 > The test suite, developer docs and demo seeders live outside the
 > published tree (`tests/`, `docs/`, `demo/` are gitignored in this
