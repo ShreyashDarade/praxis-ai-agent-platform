@@ -288,3 +288,4 @@ def compile_procedure(manifest: SkillManifest, lookup: SkillLookup) -> Procedure
         tools=procedure.tool_names,
     )
     return procedure
+

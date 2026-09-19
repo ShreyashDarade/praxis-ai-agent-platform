@@ -761,3 +761,4 @@ class CapabilityFactory:
                 code_hash=compute_code_hash(module_code),
             )
         return registered_skill
+
