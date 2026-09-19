@@ -37,7 +37,6 @@ from praxis.agents.subagent import discover_agents
 from praxis.config import Settings
 from praxis.connectors.bootstrap import build_registry
 from praxis.connectors.registry import ConnectorRegistry
-from praxis.connectors.sql.sql_connector import SQLConnector
 from praxis.core.dead_letter import DeadLetterQueue
 from praxis.core.exceptions import ApprovalTimeoutError
 from praxis.core.interfaces import HealthStatus
@@ -136,21 +135,7 @@ def _build_connector_registry() -> ConnectorRegistry:
         settings = Settings()
     except Exception:  # noqa: BLE001
         return ConnectorRegistry()
-    registry = build_registry(settings)
-
-    # Phase 11 (spec §16.2's "customer-db"): a narrow, explicitly
-    # demo-labeled exception to `SQLConnector`'s own "no global DSN"
-    # design principle (see its docstring) - registers the one demo
-    # connector this phase's dashboard walkthrough needs, by the exact
-    # name (`"customer-db"`) spec §16.2's own example `/intent` payload
-    # names, only when this one demo-only setting is actually
-    # configured; skipped (not failed) otherwise, exactly like every
-    # other optional connector above.
-    if settings.demo_customer_db_dsn:
-        registry.register(
-            SQLConnector(dsn=settings.demo_customer_db_dsn, name="customer-db", read_only=True)
-        )
-    return registry
+    return build_registry(settings)
 
 
 # Connector *membership* is fixed at process startup (deployment config,

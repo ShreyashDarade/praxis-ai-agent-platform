@@ -25,15 +25,15 @@ different reason (no existing skill is even shaped right for "query an
 arbitrary customer's SQL schema").
 
 **Deliberately NOT advertised for SQL/schema-aware querying** (see
-`inputs["query"]`'s own description below): this skill's real
-`build_registry(Settings())` lookup never includes Phase 11's demo-only
-`"customer-db"` connector at all (see the docstring paragraph below), so
-a plan that tried to route the dashboard walkthrough's "chart weekly
-signup counts" ask through this skill would simply fail with an unknown-
-connector error - the Planner must synthesize a bespoke, schema-aware
-capability for that instead (spec §16.2). The `query` input's wording
-exists specifically to steer a real Planner call away from reaching for
-this generic tool where a purpose-built one is actually needed.
+`inputs["query"]`'s own description below): this skill resolves names
+through `build_registry(Settings())`, which holds only the connectors a
+deployment has configured. A bespoke customer database reached for by
+name is simply not in it, so a plan routed through this skill fails
+with an unknown-connector error naming the connectors that do exist -
+the Planner must synthesize a purpose-built, schema-aware capability
+for that instead. The `query` input's wording exists specifically to
+steer a real Planner call away from reaching for this generic tool
+where a purpose-built one is actually needed.
 
 `connector.read()` is structurally read-only on every `Connector` (the
 ABC keeps mutation strictly behind the separate `write()` method - see
@@ -46,12 +46,11 @@ hand-written skill in this package (`post_slack_message.py`,
 `retrieve_documents.py`, `create_chart.py`): a fresh `Settings()` +
 `build_registry(Settings())` per call, so this skill always reflects
 whatever connectors this deployment currently has configured, with
-nothing cached or shared across calls to go stale. Note this
-deliberately does NOT see Phase 11's demo-only `"customer-db"`
-connector (`praxis.api.main`'s own module-level registration, not part
-of `praxis.connectors.bootstrap.build_registry`) - that connector is
-reached only via the Capability Factory's connector-aware synthesis
-path (spec §16.2), never via this generic tool.
+nothing cached or shared across calls to go stale. A connector
+registered outside `build_registry` - by a deployment's own startup
+code, or by a test - is deliberately not visible here; it is reached
+through the Capability Factory's connector-aware synthesis path, never
+through this generic tool.
 """
 from __future__ import annotations
 

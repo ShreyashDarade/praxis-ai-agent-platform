@@ -1,6 +1,7 @@
 # Worktrees (subagent-driven-development, using-git-worktrees)
 .worktrees/
 worktrees/
+.claude/
 
 # SDD scratch workspace (ledgers, briefs, review packages)
 .superpowers/

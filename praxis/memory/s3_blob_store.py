@@ -37,7 +37,7 @@ lookup, which is exactly what `is_key_in_tenant` relies on.
 **Honest limitation.** Everything here is verified against key
 construction, tenant namespacing and error mapping - the last of those
 end to end through a real `aioboto3` client against a real HTTP
-endpoint (see `tests/memory/test_s3_blob_store.py`). Behavior that
+endpoint. Behavior that
 needs a live S3 account - IAM, SSE-KMS, versioning, multipart
 thresholds for very large objects - is not exercised here and is not
 claimed to be.

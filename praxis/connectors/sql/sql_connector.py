@@ -17,12 +17,10 @@ regardless of dialect.
 Like `PostgresConnector`, there is no *general-purpose* global `Settings`
 field for this: "connect to any SQL database" has no single DSN to gate
 a factory on, so instantiating one is left to whoever needs it (a task,
-a test), not auto-registered by `praxis.connectors.bootstrap`. Phase 11
-adds exactly one narrow, explicitly demo-labeled exception to this -
-`Settings.demo_customer_db_dsn`, registered as `"customer-db"` by
-`praxis.api.main` (not by `praxis.connectors.bootstrap.build_registry`
-itself) purely for spec §16.2's dashboard walkthrough - see that
-setting's own docstring; it is not a template for a second one.
+a test, a deployment's own startup code), never auto-registered by
+`praxis.connectors.bootstrap`. There is no exception to this and none
+should be added: a global DSN field for "the" SQL database is exactly
+the assumption that stops this connector serving several.
 """
 from __future__ import annotations
 

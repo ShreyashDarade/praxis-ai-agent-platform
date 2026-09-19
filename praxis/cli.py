@@ -45,11 +45,19 @@ async def _validate_config(settings: Settings) -> str:
 
 def _alembic_config() -> AlembicConfig:
     # Bare Config (no alembic.ini) so this works regardless of cwd; the
-    # connection itself is resolved by migrations/env.py's own
+    # connection itself is resolved by the migration env's own
     # Settings().database_url, never hardcoded here.
-    repo_root = Path(__file__).resolve().parent.parent
+    #
+    # Resolved INSIDE the package, not beside it. As a sibling of
+    # `praxis/` this worked only from a source checkout: an installed
+    # wheel puts `praxis/` in site-packages with no repo around it, and
+    # `praxis.cli init` would have pointed at a directory that does not
+    # exist there. Shipping the revisions as package data makes schema
+    # management work wherever the package does.
     config = AlembicConfig()
-    config.set_main_option("script_location", str(repo_root / "migrations"))
+    config.set_main_option(
+        "script_location", str(Path(__file__).resolve().parent / "migrations")
+    )
     return config
 
 

@@ -574,17 +574,16 @@ class CapabilityFactory:
         connector whose underlying data source is stable for the
         connector's whole life (Prometheus, GitHub, Slack, MCP servers -
         one name, one real endpoint, forever). It is the WRONG key for a
-        connector like the dashboard demo's "customer-db"
-        (`SQLConnector`), which is deliberately re-registered under the
-        *same* name against a *different* DSN every test run / every
-        redeploy (a fresh tmp_path SQLite file each time). Keying purely
-        by name meant a schema cached (or a GraphStore `describes` edge
-        written) for one run's SQLite file got silently reused by a
-        later run's differently-seeded file of the same connector name -
-        traced directly to a real, intermittent full-suite failure (the
-        dashboard walkthrough passing every time in isolation, failing
-        only when it ran after an earlier suite member had already
-        cached a "customer-db" schema). Folding in a DSN digest (when the
+        `SQLConnector`, which is routinely registered under the *same*
+        name against a *different* DSN per environment, per tenant, or
+        per run. Keying purely by name meant a schema cached (or a
+        GraphStore `describes` edge written) for one database got
+        silently reused by a later run pointing the same connector name
+        at different data - traced directly to a real, intermittent
+        full-suite failure, where a walkthrough passed every time in
+        isolation and failed only when it ran after an earlier suite
+        member had already cached a schema under that name. Folding in a
+        DSN digest (when the
         connector exposes one - `SQLConnector`/`PostgresConnector`'s own
         `.dsn` property) makes the identity - and therefore the cache
         key and the GraphStore lineage node - change whenever the actual

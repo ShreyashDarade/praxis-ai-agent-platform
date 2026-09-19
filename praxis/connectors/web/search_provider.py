@@ -42,15 +42,12 @@ class TavilySearchProvider(SearchProvider):
     `response_time`, deliberately ignored here - only `results` is
     consumed). **No live Tavily API key is configured in this
     environment** - see `WebConnector.search`'s docstring for the
-    "not configured" posture this leads to. `tests/connectors/web/
-    test_search_provider.py` therefore proves the request-shaping and
-    response-parsing logic against a `respx`-mocked, realistic Tavily
-    response, exactly like this codebase's existing pattern for every
-    other credential-gated connector (e.g.
-    `tests/connectors/github/test_github_connector.py`) - a real live-
-    API end-to-end call needs a key this environment doesn't have, and
-    is explicitly not attempted here rather than silently skipped
-    without saying so.
+    "not configured" posture this leads to. The request-shaping and
+    response-parsing logic is therefore proven against a `respx`-mocked,
+    realistic Tavily response, exactly like this codebase's pattern for
+    every other credential-gated connector - a real live-API end-to-end
+    call needs a key this environment doesn't have, and is explicitly
+    not attempted rather than silently skipped without saying so.
     """
 
     def __init__(self, api_key: str, *, timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS) -> None:

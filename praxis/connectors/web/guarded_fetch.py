@@ -32,8 +32,7 @@ hop* - never only on the first request:
    (`_sniff_looks_like`) so a mislabeled `Content-Type` header alone
    can't smuggle a disallowed body past step 5.
 
-**A note on how this is tested** (see `tests/connectors/web/
-test_guarded_fetch.py`): `respx` intercepts at `httpcore`'s connection-
+**A note on how this is tested**: `respx` intercepts at `httpcore`'s connection-
 pool layer, one level *above* where a real TCP socket would actually be
 opened - so a mocked test genuinely proves steps 1-3 and 5-6 (an SSRF
 rejection mid-redirect-chain, a byte-cap abort, a content-type

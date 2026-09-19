@@ -79,9 +79,10 @@ is picked up well within a deployment's lifetime. The durable record
 path in front of it.
 
 The key includes a digest of the connector's DSN, not just its name:
-the dashboard demo re-registers "customer-db" against a different
-SQLite file every run, and a name-only key silently served one run's
-schema to the next (see `CapabilityFactory._connector_identity`).
+a `SQLConnector` is routinely registered under one stable name against
+a database that differs per environment, per tenant, or per run, and a
+name-only key silently served one database's schema for another (see
+`CapabilityFactory._connector_identity`).
 Never similarity-matched: a schema that is *nearly* right generates SQL
 that fails, or worse, silently reads the wrong column.
 """

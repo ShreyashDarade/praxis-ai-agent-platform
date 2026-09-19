@@ -4,7 +4,7 @@
 "A `Visualizer` interface (Plotly-backed for MVP) accepting a tabular
 result + chart type + encoding, returning a chart artifact
 (image/HTML). This is what the Factory calls when synthesizing any
-chart-producing skill (the dashboard demo case) - chart backend is
+chart-producing skill - chart backend is
 swappable behind the interface like everything else."
 
 `data` is exactly the shape a real tabular result already has
