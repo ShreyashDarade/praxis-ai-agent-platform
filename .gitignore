@@ -43,10 +43,14 @@ praxis/agents/_quarantine/
 # test suite, the honest-status matrices, or the dev tooling, so CI and
 # any reviewer working from the remote cannot verify a claim against
 # the tests that back it.
-docs/
-tests/
-scripts/
-demo/
+# Anchored to the repository root on purpose. Unanchored, `scripts/`
+# matches a directory of that name at ANY depth - which silently
+# excluded .github/scripts/ and shipped a workflow whose script was
+# never committed.
+/docs/
+/tests/
+/scripts/
+/demo/
 
 # Build artifacts
 dist/
