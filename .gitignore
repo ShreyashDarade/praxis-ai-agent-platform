@@ -45,6 +45,7 @@ praxis/agents/_quarantine/
 docs/
 tests/
 scripts/
+demo/
 
 # Build artifacts
 dist/

@@ -419,7 +419,7 @@ class Settings(BaseSettings):
     # pattern for "the" external SQL database Praxis talks to, and nothing
     # else in this codebase should ever grow a second field like it.
     # Deliberately a SQLite DSN in practice (see
-    # `praxis/demo/seed_customer_db.py`'s docstring for exactly why): any
+    # `demo/seed_customer_db.py`'s docstring for exactly why): any
     # *synthesized* skill's sandbox self-test can only import the Python
     # standard library, and stdlib has no Postgres driver but does have
     # `sqlite3` - so this is the one backend a synthesized "query this
