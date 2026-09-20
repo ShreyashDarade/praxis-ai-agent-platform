@@ -304,3 +304,4 @@ def downgrade() -> None:
             op.drop_table(table)
     if _has_column("tasks", "plan"):
         op.drop_column("tasks", "plan")
+

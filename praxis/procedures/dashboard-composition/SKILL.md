@@ -88,3 +88,4 @@ more cheaply.
   about what "revenue" means.
 - It cannot render client-side interactivity. The output is a declarative
   spec, deliberately — never generated browser JavaScript.
+

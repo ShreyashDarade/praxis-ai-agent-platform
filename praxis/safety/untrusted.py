@@ -118,3 +118,4 @@ def is_wrapped(text: str) -> bool:
     """True iff `text` already carries the untrusted fence - so a value
     passed through two layers isn't double-wrapped."""
     return text.startswith("<<<UNTRUSTED_CONTENT") and text.rstrip().endswith(UNTRUSTED_CLOSE)
+
