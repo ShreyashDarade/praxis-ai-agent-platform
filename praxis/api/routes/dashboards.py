@@ -273,3 +273,4 @@ async def delete_dashboard(
     finally:
         await store.dispose()
     return {"id": dashboard_id, "deleted": True}
+

@@ -59,3 +59,4 @@ def downgrade() -> None:
     op.drop_index("ix_task_checkpoints_tenant_id", table_name="task_checkpoints")
     op.drop_index("ix_task_checkpoints_task_id", table_name="task_checkpoints")
     op.drop_table("task_checkpoints")
+

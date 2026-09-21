@@ -472,3 +472,4 @@ class MemoryStore:
             confidence=1.0,
             detail=detail,
         )
+
