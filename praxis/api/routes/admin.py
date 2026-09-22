@@ -300,3 +300,4 @@ async def read_audit_log(
             for row in rows
         ]
     }
+

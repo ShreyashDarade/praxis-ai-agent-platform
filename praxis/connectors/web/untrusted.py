@@ -31,3 +31,4 @@ def wrap_untrusted(content: str, source: str) -> str:
     only surrounded, never mangled, escaped, or truncated."""
     open_tag = _OPEN_TAG_TEMPLATE.format(source=source)
     return f"{open_tag}\n{_WARNING}\n\n{content}\n{_CLOSE_TAG}"
+
