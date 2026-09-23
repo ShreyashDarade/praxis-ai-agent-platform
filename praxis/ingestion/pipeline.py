@@ -233,3 +233,4 @@ async def retrieve(
     return await vector_store.similarity_search(
         query_embedding, top_k=top_k, tenant_id=tenant_id
     )
+
