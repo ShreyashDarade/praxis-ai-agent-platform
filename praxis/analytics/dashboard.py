@@ -356,3 +356,4 @@ def negotiate(panel: PanelSpec, renderer_supports: set[str]) -> str:
         ),
         problems=[f"no renderable chart type for panel '{panel.panel_id}'"],
     )
+

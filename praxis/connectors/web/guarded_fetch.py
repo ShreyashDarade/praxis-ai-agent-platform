@@ -232,3 +232,4 @@ async def fetch(
                 )
             finally:
                 await response.aclose()
+
