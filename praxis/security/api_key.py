@@ -47,3 +47,4 @@ def looks_like_api_key(value: str) -> bool:
     """Cheap shape check used to give a clearer 401 ("malformed key")
     than a bare lookup miss would."""
     return value.startswith(KEY_PREFIX) and len(value) > len(KEY_PREFIX) + 20
+
