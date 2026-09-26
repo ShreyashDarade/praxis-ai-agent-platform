@@ -108,3 +108,4 @@ def get_default_embedder() -> SentenceTransformerEmbedder:
     if _default_instance is None:
         _default_instance = SentenceTransformerEmbedder()
     return _default_instance
+

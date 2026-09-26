@@ -72,3 +72,4 @@ class TableAwareChunker(Chunker):
 
         flush()
         return chunks
+

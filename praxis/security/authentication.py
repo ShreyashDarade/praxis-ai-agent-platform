@@ -103,4 +103,3 @@ def extract_credential(
         if len(parts) == 2 and parts[0].lower() == "bearer":
             return parts[1].strip()
     return None
-
