@@ -328,3 +328,4 @@ def validate_query_request(
             issues=issues,
         )
     return issues
+

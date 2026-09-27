@@ -627,3 +627,4 @@ class AgentLoop:
                 }
             )
         return snapshots
+

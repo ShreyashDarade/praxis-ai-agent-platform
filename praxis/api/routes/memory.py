@@ -162,3 +162,4 @@ async def forget_memory(
             status_code=404, detail=f"no {kind} memory with key '{key}' in this scope"
         )
     return {"forgotten": key, "versions_removed": removed}
+
