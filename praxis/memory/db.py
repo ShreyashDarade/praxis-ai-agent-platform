@@ -31,3 +31,4 @@ class PostgresStore(RelationalStore):
 
     async def dispose(self) -> None:
         await self._engine.dispose()
+

@@ -252,3 +252,4 @@ def authorize_cache_hit(principal: Principal | None, entry_tenant_id: str | None
         principal_tenant=principal_tenant or NO_PRINCIPAL,
         resource_tenant=entry_tenant_id or NO_PRINCIPAL,
     )
+
