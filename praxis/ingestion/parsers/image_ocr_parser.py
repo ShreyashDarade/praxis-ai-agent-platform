@@ -32,3 +32,4 @@ class ImageOcrParser(Parser):
 # etc). A caller wanting a different OcrEngine constructs its own
 # ImageOcrParser directly rather than going through the registry.
 register_parser(ImageOcrParser(TesseractOcrEngine()))
+

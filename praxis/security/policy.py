@@ -309,3 +309,4 @@ class PolicyEngine:
 # One shared, stateless instance - constructing a new engine per call
 # would allocate for no reason; it holds nothing.
 policy_engine = PolicyEngine()
+
