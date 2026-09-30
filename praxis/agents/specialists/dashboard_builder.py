@@ -138,3 +138,4 @@ class DashboardBuilderAgent(SubAgent):
 
 
 register_agent(DashboardBuilderAgent())
+

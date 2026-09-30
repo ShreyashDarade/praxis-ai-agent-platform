@@ -377,3 +377,4 @@ class ResilientConnector(Connector):
     async def health(self) -> HealthStatus:
         # See the class docstring: never guarded.
         return await self._inner.health()
+

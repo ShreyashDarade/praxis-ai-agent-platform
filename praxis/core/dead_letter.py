@@ -227,3 +227,4 @@ class DeadLetterQueue:
         for state in rows:
             counts[state] = counts.get(state, 0) + 1
         return counts
+
