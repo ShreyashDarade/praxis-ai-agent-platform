@@ -170,3 +170,4 @@ def redact(value: Any, *, _depth: int = 0) -> Any:
     if isinstance(value, set):
         return [redact(item, _depth=_depth + 1) for item in sorted(value, key=str)]
     return value
+

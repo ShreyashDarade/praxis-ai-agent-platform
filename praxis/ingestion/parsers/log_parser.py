@@ -136,3 +136,4 @@ def _level_of(line: str) -> str | None:
 
 
 register_parser(LogParser())
+

@@ -56,4 +56,3 @@ class TabularParser(Parser):
 
 
 register_parser(TabularParser())
-
