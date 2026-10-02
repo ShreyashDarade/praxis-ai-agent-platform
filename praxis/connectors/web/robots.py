@@ -79,3 +79,4 @@ async def is_allowed(url: str, user_agent: str = DEFAULT_USER_AGENT) -> bool:
     parser = RobotFileParser()
     parser.parse(robots_text.splitlines())
     return parser.can_fetch(user_agent, url)
+

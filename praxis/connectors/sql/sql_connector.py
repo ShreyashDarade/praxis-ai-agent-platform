@@ -216,3 +216,4 @@ def _introspect(sync_conn: SyncConnection) -> dict[str, Any]:
             for column in inspector.get_columns(table_name)
         ]
     return schema
+

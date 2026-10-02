@@ -79,3 +79,4 @@ def discover_parsers() -> None:
             continue
         importlib.import_module(f"praxis.ingestion.parsers.{module_info.name}")
     _DISCOVERED = True
+
