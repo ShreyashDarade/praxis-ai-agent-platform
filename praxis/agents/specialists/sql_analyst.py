@@ -150,3 +150,4 @@ class SqlAnalystAgent(SubAgent):
 
 
 register_agent(SqlAnalystAgent())
+
