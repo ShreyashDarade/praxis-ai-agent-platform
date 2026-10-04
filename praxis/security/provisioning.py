@@ -150,3 +150,4 @@ async def revoke_api_key(store: PostgresStore, *, key_id: str) -> ApiKey:
         record.revoked_at = datetime.now(UTC)
         await session.commit()
         return record
+

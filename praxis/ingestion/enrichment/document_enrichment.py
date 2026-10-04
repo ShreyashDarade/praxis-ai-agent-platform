@@ -102,3 +102,4 @@ class DocumentEnrichment:
             await graph_store.add_edge(source=doc_id, relation="mentions", target=entity)
 
         return result
+

@@ -325,4 +325,3 @@ class SqlGuard:
 # The default guard: sensible bounds, no table restrictions (a
 # deployment that wants an allow-list constructs its own).
 default_sql_guard = SqlGuard()
-

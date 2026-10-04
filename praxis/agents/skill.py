@@ -49,3 +49,4 @@ class Skill(abc.ABC):
 
     @abc.abstractmethod
     async def run(self, **kwargs: Any) -> Any: ...
+
