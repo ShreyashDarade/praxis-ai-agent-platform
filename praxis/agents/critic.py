@@ -319,4 +319,3 @@ def _parse_review_response(raw: str) -> list[dict[str, Any]]:
     if not isinstance(parsed, list):
         raise ValueError(f"expected a JSON array of verdicts, got {type(parsed).__name__}")
     return [entry for entry in parsed if isinstance(entry, dict)]
-

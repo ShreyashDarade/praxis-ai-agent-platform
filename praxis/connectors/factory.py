@@ -75,3 +75,4 @@ def required(value: str | None, *, setting: str) -> str:
             "the factory's is_configured and build disagree"
         )
     return value
+
