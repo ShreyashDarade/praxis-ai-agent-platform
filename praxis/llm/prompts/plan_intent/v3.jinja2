@@ -112,3 +112,4 @@ Example response, for an intent that only needs one call to a skill named "examp
 
 Example response for an intent needing a not-yet-existing query step whose output is then charted by an existing "create_chart" skill (inputs: data, chart_type, encoding) - note "signup_count" is spelled identically in both the invented query's own column alias and the later step's "encoding":
 [{"skill_name": "query_weekly_signups", "args": {"query": "SELECT week, COUNT(*) AS signup_count FROM signups GROUP BY week"}, "depends_on": []}, {"skill_name": "create_chart", "args": {"data": "$0.rows", "chart_type": "bar", "encoding": {"x": "week", "y": "signup_count"}}, "depends_on": [0]}]
+

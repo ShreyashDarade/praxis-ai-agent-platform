@@ -124,3 +124,4 @@ class SearchProviderNotConfiguredError(FetchError):
     failure, never a silent empty-results no-op that looks like a
     genuine "no results found" (spec §12 distinguishes that as
     `barren`, a different outcome from "can't even try")."""
+
