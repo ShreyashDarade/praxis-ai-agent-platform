@@ -336,3 +336,4 @@ def _mime_type_for(name: str, payload: bytes) -> str | None:
 
 
 registry.register_parser(ArchiveParser())
+

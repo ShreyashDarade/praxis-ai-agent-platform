@@ -33,3 +33,4 @@ async def health() -> JSONResponse:
         ],
     }
     return JSONResponse(content=body, status_code=200 if overall else 503)
+
