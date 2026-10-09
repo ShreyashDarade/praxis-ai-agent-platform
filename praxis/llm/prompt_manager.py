@@ -48,4 +48,3 @@ class PromptManager:
                 f"unknown prompt template '{name}@{version}' (expected file at {expected})"
             ) from None
         return template.render(**context)
-
