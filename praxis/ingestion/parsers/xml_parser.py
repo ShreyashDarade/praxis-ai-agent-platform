@@ -294,4 +294,3 @@ def _refuse_doctype(text: str) -> None:
 
 
 register_parser(XmlParser())
-

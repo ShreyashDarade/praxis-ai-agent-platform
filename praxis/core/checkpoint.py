@@ -352,4 +352,3 @@ class PraxisCheckpointSaver(BaseCheckpointSaver):
         raise NotImplementedError(
             "PraxisCheckpointSaver is async-only; drive the graph with ainvoke/astream"
         )
-

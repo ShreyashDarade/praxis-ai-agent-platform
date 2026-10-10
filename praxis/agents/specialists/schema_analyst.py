@@ -173,3 +173,4 @@ class SchemaAnalystAgent(SubAgent):
 
 
 register_agent(SchemaAnalystAgent())
+
