@@ -58,3 +58,4 @@ class WebCrawlSkill(Skill):
 
 if _WEB_TOOLS_ENABLED:
     register_skill(WebCrawlSkill())
+

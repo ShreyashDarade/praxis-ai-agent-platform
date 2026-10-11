@@ -111,3 +111,4 @@ class CreateChartSkill(Skill):
 
 
 register_skill(CreateChartSkill())
+
