@@ -421,3 +421,4 @@ Defaults need no managed service: in-process cache, filesystem blobs.
 | `praxis/semantic/` | Metrics, dimensions, joins, grain validation |
 | `praxis/llm/` | Provider routing, catalogue, prompts |
 | `praxis/migrations/` | Alembic revisions, shipped as package data |
+

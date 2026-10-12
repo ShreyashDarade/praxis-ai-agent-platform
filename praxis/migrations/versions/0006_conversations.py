@@ -89,3 +89,4 @@ def downgrade() -> None:
         op.drop_table("messages")
     if _has_table("conversations"):
         op.drop_table("conversations")
+

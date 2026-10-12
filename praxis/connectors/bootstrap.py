@@ -168,3 +168,4 @@ def build_registry(settings: Settings) -> ConnectorRegistry:
             )
         )
     return registry
+
