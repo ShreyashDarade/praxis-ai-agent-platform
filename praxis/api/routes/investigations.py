@@ -160,3 +160,4 @@ async def investigate(
     payload["spend"] = tracker.snapshot()
     payload["authorized_tools"] = list(tool_names)
     return payload
+

@@ -97,3 +97,4 @@ class AuditLogger:
             detail=detail,
             correlation_id=correlation_id,
         )
+
