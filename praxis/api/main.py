@@ -578,3 +578,4 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
 # the top of the module is what makes `app` importable by the route
 # modules in the first place.
 app.router.lifespan_context = _lifespan
+
