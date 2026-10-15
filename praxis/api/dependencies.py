@@ -298,3 +298,4 @@ async def authorize_resource_or_404(
         # on a `NoReturn` the checker cannot infer conditionally.
         raise HTTPException(status_code=404, detail=f"no {resource_type} with id '{resource_id}'")
     return record
+

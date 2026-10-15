@@ -219,3 +219,4 @@ def s3_blob_store_from_settings(settings: Any) -> S3BlobStore | None:
         endpoint_url=getattr(settings, "s3_endpoint_url", None),
         region_name=getattr(settings, "s3_region", None),
     )
+
