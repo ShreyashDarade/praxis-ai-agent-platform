@@ -204,3 +204,4 @@ async def describe_uploaded_table(data: bytes, mime_type: str) -> TableSchema:
     """The typed schema of an uploaded file, without running a query."""
     frame = await asyncio.to_thread(load_table, data, mime_type)
     return schema_of(frame)
+

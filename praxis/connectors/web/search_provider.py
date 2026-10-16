@@ -71,4 +71,3 @@ class TavilySearchProvider(SearchProvider):
             )
             for item in data.get("results", [])
         ]
-
