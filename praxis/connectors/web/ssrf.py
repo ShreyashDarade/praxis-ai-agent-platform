@@ -136,3 +136,4 @@ def resolve_and_validate(hostname: str) -> str:
         validated.append(ip_str)
 
     return validated[0]
+

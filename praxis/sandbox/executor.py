@@ -262,3 +262,4 @@ def _try_logs(container: Any, *, stdout: bool, stderr: bool) -> str:
         return _decode(container.logs(stdout=stdout, stderr=stderr))
     except DockerException:
         return ""
+
