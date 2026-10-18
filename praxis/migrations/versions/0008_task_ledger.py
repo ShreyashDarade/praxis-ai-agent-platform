@@ -41,3 +41,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     if _has_column("tasks", "ledger"):
         op.drop_column("tasks", "ledger")
+

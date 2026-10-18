@@ -129,3 +129,4 @@ class DiagnoseAndRecordIncidentSkill(Skill):
 
 
 register_skill(DiagnoseAndRecordIncidentSkill())
+

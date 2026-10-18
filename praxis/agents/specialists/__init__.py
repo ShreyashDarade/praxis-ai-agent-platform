@@ -7,3 +7,4 @@ and skills. `praxis.agents.subagent.discover_agents()` imports every
 module in this package to trigger those registrations, so adding a
 specialist is one new file with zero edits to orchestration code.
 """
+
