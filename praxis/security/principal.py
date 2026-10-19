@@ -88,4 +88,3 @@ def system_principal_for_tenant(tenant_id: str) -> Principal:
         roles=("system",),
         is_system=True,
     )
-
