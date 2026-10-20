@@ -305,3 +305,4 @@ class BudgetTracker:
             "budget": self._budget.to_dict(),
             "elapsed_seconds": round(self.elapsed_seconds, 3),
         }
+

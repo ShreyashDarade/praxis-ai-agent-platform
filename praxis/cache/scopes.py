@@ -259,3 +259,4 @@ def require_exact_match(scope: str) -> None:
             f"similarity match; similarity matching is permitted only for "
             f"{sorted(SEMANTIC_MATCH_SCOPES)}"
         )
+
