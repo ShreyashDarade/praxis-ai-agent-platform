@@ -470,3 +470,4 @@ async def _wait_for_client_disconnect(websocket: WebSocket) -> None:
         message = await websocket.receive()
         if message["type"] == "websocket.disconnect":
             return
+
