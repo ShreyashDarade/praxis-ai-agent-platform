@@ -217,3 +217,4 @@ def _unwrap_block(block: ContentBlock) -> Any:
         except (json.JSONDecodeError, ValueError):
             return block.text
     return block.model_dump()
+

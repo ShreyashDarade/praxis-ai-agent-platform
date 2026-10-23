@@ -389,4 +389,3 @@ register_connector_factory(
         ),
     )
 )
-

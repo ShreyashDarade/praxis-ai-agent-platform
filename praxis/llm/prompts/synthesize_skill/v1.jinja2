@@ -57,3 +57,4 @@ The SELF_TEST script must:
 - Actually call the skill's `run(...)` (it is async - use `asyncio.run(...)`) with concrete, realistic argument values, using the existing instance obtained one of the two ways above.
 - Independently compute, in the SELF_TEST script itself, the correct expected answer for the fixture data it just created, and `assert` the skill's actual returned result equals that expected answer - not merely that the call didn't raise an exception.
 - On success (every assertion genuinely passed), print exactly the line `SELF_TEST_PASS` as its last action. This exact marker is the one signal that determines whether this synthesis attempt is accepted and the skill gets registered for real - never print it unless every assertion truly passed, and let a real `AssertionError` propagate (do not catch and swallow it) if something is actually wrong.
+
