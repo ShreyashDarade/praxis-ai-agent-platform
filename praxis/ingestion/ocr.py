@@ -33,3 +33,4 @@ class TesseractOcrEngine(OcrEngine):
     def _extract_sync(image_bytes: bytes) -> str:
         with Image.open(io.BytesIO(image_bytes)) as image:
             return pytesseract.image_to_string(image)
+
